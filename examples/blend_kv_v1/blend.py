@@ -9,7 +9,7 @@ import time
 # Third Party
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
-from vllm.config import KVTransferConfig
+from vllm.config import CompilationConfig, KVTransferConfig
 from vllm.engine.arg_utils import EngineArgs
 
 # First Party
@@ -32,7 +32,9 @@ def setup_environment_variables(
     os.environ["LMCACHE_BLEND_SPECIAL_STR"] = blend_special_str
     os.environ["LMCACHE_USE_LAYERWISE"] = "True"
     os.environ["LMCACHE_BLEND_CHECK_LAYERS"] = "1"
-    os.environ["LMCACHE_BLEND_RECOMPUTE_RATIOS"] = "0.15"
+    os.environ["LMCACHE_BLEND_RECOMPUTE_RATIOS"] = os.environ.get(
+        "LMCACHE_BLEND_RECOMPUTE_RATIOS", "0.15"
+    )
 
     if enable_sparse:
         os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
@@ -69,12 +71,18 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
         model=model,
         kv_transfer_config=ktc,
         max_model_len=32648,
-        gpu_memory_utilization=0.7,
+        gpu_memory_utilization=0.92,
         enable_prefix_caching=False,
         enforce_eager=True,
+        # vLLM 0.27.x: CompilationConfig.cudagraph_capture_sizes must be a
+        # non-empty list, otherwise pydantic raises a ValidationError. Provide
+        # it explicitly (disable CUDA graph capture) to satisfy the schema.
+        compilation_config=CompilationConfig(cudagraph_capture_sizes=[0]),
     )
 
-    llm = LLM(**asdict(llm_args))
+    # vLLM 0.27.1: asdict() passes None fields explicitly, which some nested
+    # configs reject; drop None fields so defaults apply.
+    llm = LLM(**{k: v for k, v in asdict(llm_args).items() if v is not None})
     try:
         yield llm
     finally:
