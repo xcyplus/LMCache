@@ -9,7 +9,7 @@ import time
 # Third Party
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
-from vllm.config import CompilationConfig, KVTransferConfig
+from vllm.config import KVTransferConfig
 from vllm.engine.arg_utils import EngineArgs
 
 # First Party
@@ -74,15 +74,21 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
         gpu_memory_utilization=0.92,
         enable_prefix_caching=False,
         enforce_eager=True,
-        # vLLM 0.27.x: CompilationConfig.cudagraph_capture_sizes must be a
-        # non-empty list, otherwise pydantic raises a ValidationError. Provide
-        # it explicitly (disable CUDA graph capture) to satisfy the schema.
-        compilation_config=CompilationConfig(cudagraph_capture_sizes=[0]),
+        # vLLM 0.27.x auto-enables fault tolerance, which requires an external
+        # load balancer mode this single-node example doesn't configure. Disable
+        # it explicitly to avoid the startup ValueError.
+        enable_fault_tolerance=False,
     )
 
     # vLLM 0.27.1: asdict() passes None fields explicitly, which some nested
-    # configs reject; drop None fields so defaults apply.
-    llm = LLM(**{k: v for k, v in asdict(llm_args).items() if v is not None})
+    # configs reject; drop None fields so defaults apply. Also pop
+    # fault_tolerance_config: asdict() turns the dataclass default into a
+    # plain dict, which vLLM misreads as user-passed config and force-enables
+    # fault tolerance (unsupported offline) -- enable_fault_tolerance=False
+    # alone gets overridden by that path.
+    engine_kwargs = {k: v for k, v in asdict(llm_args).items() if v is not None}
+    engine_kwargs.pop("fault_tolerance_config", None)
+    llm = LLM(**engine_kwargs)
     try:
         yield llm
     finally:
