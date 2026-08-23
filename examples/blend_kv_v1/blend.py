@@ -9,7 +9,7 @@ import time
 # Third Party
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
-from vllm.config import KVTransferConfig
+from vllm.config import CompilationConfig, KVTransferConfig
 from vllm.engine.arg_utils import EngineArgs
 
 # First Party
@@ -78,6 +78,12 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
         # load balancer mode this single-node example doesn't configure. Disable
         # it explicitly to avoid the startup ValueError.
         enable_fault_tolerance=False,
+        # REQUIRED, not redundant: EngineArgs' default compilation_config is
+        # a dataclass whose cudagraph_capture_sizes is None; asdict() exports
+        # that nested None explicitly and pydantic rejects it. [0] disables
+        # cudagraph capture (enforce_eager already does) while satisfying
+        # the schema.
+        compilation_config=CompilationConfig(cudagraph_capture_sizes=[0]),
     )
 
     # vLLM 0.27.1: asdict() passes None fields explicitly, which some nested
