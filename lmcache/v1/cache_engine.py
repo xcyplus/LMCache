@@ -79,7 +79,11 @@ ProcessTokensInternalResult = Tuple[List[ProcessedChunk], int]
 class CacheEngineEndSignal:
     pass
 
-
+# 1. MP connector 完全不引用`LMCacheEngine` ——`lmcache_mp_connector.py` 里搜不到`LMCacheEngine` 。
+#     它只做 ZMQ 通信，把请求序列化发出去，根本不在本地建存储引擎。
+# 2. MP cache server 也不用`LMCacheEngine` ——`multiprocess/`
+#     目录下只有`mp_runtime_plugin_launcher.py` 引用了它（那是个启动插件），server 
+#     核心代码直接用`StorageManager`
 class LMCacheEngine:
     """The main class for the cache engine.
 

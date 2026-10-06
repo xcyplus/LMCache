@@ -68,7 +68,7 @@ class LRUEvictionPolicy(EvictionPolicy):
         with self._lock:
             if destination not in self._destinations:
                 self._destinations.append(destination)
-
+# 新 key 入账 → 插到队尾
     def on_keys_created(self, keys: list[ObjectKey]):
         """
         Notify the eviction policy that new keys have been created.
@@ -90,7 +90,7 @@ class LRUEvictionPolicy(EvictionPolicy):
                 else:
                     # Add new key at the end (most recently used)
                     self._order[key] = None
-
+# key 被访问 → 提到队尾
     def on_keys_touched(self, keys: list[ObjectKey]):
         """
         Notify the eviction policy that keys have been accessed.
@@ -108,7 +108,7 @@ class LRUEvictionPolicy(EvictionPolicy):
                 if key in self._order:
                     # Move to end (most recently used)
                     self._order.move_to_end(key)
-
+# key 被删 → 出账
     def on_keys_removed(self, keys: list[ObjectKey]):
         """
         Notify the eviction policy that keys have been deleted.
@@ -124,7 +124,7 @@ class LRUEvictionPolicy(EvictionPolicy):
                 # Remove from LRU order tracking
                 if key in self._order:
                     del self._order[key]
-
+# 核心：挑选受害者
     def get_eviction_actions(
         self,
         expected_ratio: float,

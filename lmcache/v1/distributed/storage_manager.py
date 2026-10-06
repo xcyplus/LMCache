@@ -67,15 +67,15 @@ logger = init_logger(__name__)
 
 class StorageManager:
     def __init__(self, config: StorageManagerConfig):
-        self._l1_manager = L1Manager(config.l1_manager_config)
+        self._l1_manager = L1Manager(config.l1_manager_config)  # 1：创建 L1Manager ：根据配置选择 DRAM / DevDAX / GDS 三种内存管理器之一
         self._event_bus = get_event_bus()
 
         # L1 eviction controller
         self._eviction_controller = L1EvictionController(
             l1_manager=self._l1_manager,
             eviction_config=config.eviction_config,
-        )
-        self._eviction_controller.start()
+        )  # 2： 启动 L1 淘汰控制器 ：`L1EvictionController.start()` 后台跑淘汰循环
+        self._eviction_controller.start()  # 里面的eviction_loop 已经开启了
 
         # L2 adapters and store controller. When an adapter config carries
         # a ``serde_config``, the adapter is wrapped with

@@ -228,7 +228,7 @@ class LookupModule:
 
         extra_count = compute_extra_count(tp_size, world_size)
 
-        chunk_hashes = self._ctx.token_hasher.compute_chunk_hashes(list(key.token_ids))
+        chunk_hashes = self._ctx.token_hasher.compute_chunk_hashes(list(key.token_ids)) # 按照chunk粒度计算hash值
         if not chunk_hashes:
             self._register_prefetch_job(
                 _PrefetchJob(
@@ -315,7 +315,8 @@ class LookupModule:
                 )
             )
             return
-
+# 这一步把 chunk 对应的`ObjectKey` 列表交给`StorageManager.submit_prefetch_task()` 
+# 由它内部去查 L1/L2 并启动预取。返回的`handle` 被包进`_PrefetchJob` 存进`_prefetch_jobs` 。
         handle = self._ctx.storage_manager.submit_prefetch_task(
             PrefetchRequestSpec(
                 keys=obj_keys,

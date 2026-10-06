@@ -72,7 +72,7 @@ from lmcache.v1.platform.base.cache_context import BaseCacheContext
 
 logger = init_logger(__name__)
 
-
+# 管“有哪些模块、怎么组合、怎么报告状态”
 class MPCacheServer:
     """Compositor that assembles pluggable engine modules.
 
@@ -151,7 +151,7 @@ class MPCacheServer:
                 return
         raise RuntimeError("MPCacheServer.clear: no ManagementModule registered")
 
-
+# 注册server 的 handler
 def add_handler_helper(
     server: MessageQueueServer, request_type: RequestType, handler_function
 ):
@@ -164,7 +164,7 @@ def add_handler_helper(
     """
     payload_classes = get_payload_classes(request_type)
     handler_type = get_handler_type(request_type)
-    server.add_handler(
+    server.addd_handler(
         request_type,
         payload_classes,
         handler_type,
@@ -191,6 +191,14 @@ def _build_modules(
     Raises:
         ValueError: If blend engine is requested with
         supported_transfer_mode="engine_driven".
+return [
+    lookup_module,        # ① 基础模块（始终存在） 标准的 chunk 哈希查询（普通 LMCache 前缀命中查询）
+    p2p_controller,       # ② 基础模块（始终存在） 跨实例 P2P 传输控制（实例间 KV 直接搬运），依赖 coordinator 做 peer 发现
+    management,           # ③ 基础模块（始终存在） 实例存活管理（reaper 线程，定期清理死亡 worker 的状态），持有`liveness_targets`
+    *transfer_modules,    # ④ 传输模块（1~2 个，按 transfer_mode 选）
+    *experimental_modules,# ⑤ 实验性模块（0~N 个，按 --enable 选）
+    *blend_modules,       # ⑥ Blend 模块（0~1 个，按 engine_type 选）
+]
     """
     lookup_module = LookupModule(ctx)
     p2p_controller = P2PController(
@@ -332,7 +340,7 @@ def _build_modules(
         *blend_modules,
     ]
 
-
+# 开启server
 def run_cache_server(
     mp_config: MPServerConfig,
     storage_manager_config: StorageManagerConfig,
@@ -405,7 +413,7 @@ def run_cache_server(
     # construction (RuntimeError unless --no-separate-object-groups).
     is_blend = mp_config.engine_type == "blend"
 
-    ctx = MPCacheServerContext(
+    ctx = MPCacheServerContext(                                 # ① 上下文（内部创建 StorageManager）
         storage_manager_config=storage_manager_config,
         chunk_size=mp_config.chunk_size,
         hash_algorithm=mp_config.hash_algorithm,
@@ -413,8 +421,8 @@ def run_cache_server(
         full_sw_kv=is_blend,
     )
 
-    modules = _build_modules(ctx, mp_config, coordinator_config)
-    engine = MPCacheServer(ctx, modules)
+    modules = _build_modules(ctx, mp_config, coordinator_config) # ② 构建模块列表，BlendV3Module 在这里创建
+    engine = MPCacheServer(ctx, modules)   # ③ engine 组合所有模块 ← BlendV3Module 的直接持有者 
 
     InitializeMPUsageContext(mp_config, storage_manager_config)
     InitializeMPContinuousUsage(event_bus, mp_config.chunk_size)
@@ -422,16 +430,16 @@ def run_cache_server(
     InitializeL1Usage(event_bus, ctx.storage_manager)
 
     zmq_context = zmq.Context.instance()
-    server = MessageQueueServer(
+    server = MessageQueueServer(    ## ④ 通信层 创建通信层的服务： 管“怎么收请求、怎么分发、怎么发响应”   
         bind_url=f"tcp://{mp_config.host}:{mp_config.port}",
         context=zmq_context,
-    )
+    )   
 
-    all_specs: list[HandlerSpec] = []
-    for module in modules:
+    all_specs: list[HandlerSpec] = []# ⑤ 每个模块上报自己的 handler
+    for module in modules:  
         all_specs.extend(module.get_handlers())
 
-    for spec in all_specs:
+    for spec in all_specs: # ⑥ 注册到 ZMQ server
         add_handler_helper(server, spec.request_type, spec.handler)
 
     affinity_types = [
@@ -462,7 +470,7 @@ def run_cache_server(
         )
     else:
         torch_dev.init()
-    server.start()
+    server.start()  # server 就启动了
 
     logger.info("LMCache cache server is running...")
 
@@ -497,7 +505,7 @@ def parse_args():
     add_coordinator_args(parser)
     return parser.parse_args()
 
-
+# 梦的起点
 if __name__ == "__main__":
     signal.signal(signal.SIGTERM, signal.default_int_handler)
     args = parse_args()

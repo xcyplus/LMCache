@@ -182,14 +182,13 @@ class LayoutDescRegistry:
                 )
             return entry.attn_desc
 
-
+# LMCache MP 模式服务端的共享上下文容器。
+# 它把服务端所有模块需要的公共资源集中在一起，模块初始化时接收它，通过它访问共享组件。
 class MPCacheServerContext:
     """Shared infrastructure for all engine modules.
-
     Holds the storage manager, token hasher, session manager, event bus,
     and layout descriptor registry. Modules receive this context at init
     and use it for shared operations.
-
     Args:
         storage_manager_config: Configuration for the storage manager.
         chunk_size: Chunk size for KV cache operations.
@@ -197,6 +196,16 @@ class MPCacheServerContext:
         separate_object_groups: Whether to split kernel groups into one object
             group per sliding-window size at KV-cache registration. Default
             False.
+    在 MP 模式下，LMCache server 是独立进程，内部有多个模块（lookup、transfer、blend 等）。这些模块需要共享：
+    存储管理器：管理 L1/L2。
+
+    Token 哈希器：计算 chunk 哈希。
+
+    会话管理器：跟踪请求生命周期。
+
+    事件总线：可观测性。
+
+    布局描述注册表：(model_name, world_size) → MemoryLayoutDesc
     """
 
     def __init__(

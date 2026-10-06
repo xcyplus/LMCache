@@ -84,10 +84,10 @@ class ObjectKey:
     """
     The unique identifier for an object in the distributed storage manager
     """
-
+     # 这个 chunk 的内容哈希（核心字段，内容相同则哈希相同，可命中复用）
     chunk_hash: bytes
     """ Content hash of this particular chunk """
-
+    # 所属模型名（不同模型的 KV 不通用；约束：不能含 '@'，因为 L2 适配器用它做分隔符）
     model_name: str
     """ Name of the model this chunk belongs to.
 
@@ -97,13 +97,13 @@ class ObjectKey:
     alphanumerics + ``/-_.`` so this rejects nothing that appears in
     practice.
     """
-
+    # KV 切片的 rank，即张量并行的 rank（不是层号；TP 下同一 chunk 在不同 rank 上是不同 key）
     kv_rank: int
     """ The rank that uniquely identifies the slice of the KV cache """
-
+    # 所属 object group 的索引（混合模型下不同注意力类型分组；层号通过它+MemoryObj 内的 layer_stride 间接定位）
     object_group_id: int = 0
     """ Index of the object group this chunk belongs to. """
-
+    # 按用户隔离的盐值（相同 salt 可复用，不同 salt 隔离；约束：不含 '@'、'/'、'\'、NUL，长度 ≤ 128）
     cache_salt: str = ""
     """ Per-user isolation salt. Same content from different users with
     different cache_salt values produces different ObjectKeys, giving

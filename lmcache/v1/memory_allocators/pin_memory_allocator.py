@@ -29,7 +29,11 @@ class PinMemoryAllocator(MemoryAllocatorInterface):
         """
         :param int size: The size of the pinned memory in bytes.
         """
-        self.size = size
+        self.size = size  # 记录这块 pinned 内存的总大小（字节），后续释放时要传回给底层函数
+
+# 向操作系统一次性申请一整块 pinned CPU 内存（锁页内存，GPU 可 DMA 直接访问）
+# 返回一个 torch.Tensor（uint8），作为后续所有对象的“内存池”
+# 这一步只做一次，是“圈地”；后续 allocate 只是从这块地里“切分”
         self.buffer = memory_management._allocate_cpu_memory(size)
         self._unregistered = False
 

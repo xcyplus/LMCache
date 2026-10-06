@@ -59,7 +59,7 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
 
         self.buffer = memory_management._allocate_cpu_memory(
             size, self.numa_mapping, self.shm_name, use_hugepages=use_hugepages
-        )
+        ) # 向CPU 要内存
 
         self._unregistered = False
 

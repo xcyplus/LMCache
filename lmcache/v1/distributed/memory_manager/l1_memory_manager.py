@@ -59,7 +59,7 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
             config.size_in_bytes,
             config.align_bytes,
         )
-        return LazyMemoryAllocator(
+        return LazyMemoryAllocator(  #动时只分配一个较小的 init_size（如 20GB），然后启动一个后台线程，逐步将内存扩展到 final_size
             config.init_size_in_bytes, config.size_in_bytes, config.align_bytes
         )
     else:
@@ -70,7 +70,7 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
             config.align_bytes,
         )
         shm_name = config.shm_name
-        if shm_name:
+        if shm_name:  # Shared Memory 共享内存
             # Keep the lmcache_l1_pool_ prefix in normalized SHM names so
             # stale-segment cleanup can recognize and unlink user-provided names.
             bare = shm_name.lstrip("/")
@@ -82,7 +82,7 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
                 align_bytes=config.align_bytes,
                 shm_name=shm_name,
             )
-        return MixedMemoryAllocator(
+        return MixedMemoryAllocator(  #这是传统的“预分配”策略，在初始化时立即申请全部目标大小的内存池
             config.size_in_bytes,
             align_bytes=config.align_bytes,
         )
@@ -100,7 +100,7 @@ class L1MemoryManager:
 
     def __init__(self, config: L1MemoryManagerConfig):
         self._allocator = create_memory_allocator(config)
-        self._size_in_bytes = config.size_in_bytes
+        self._size_in_bytes = config.size_in_bytes  # L1 内存池的总大小（字节数）
         self._align_bytes = config.align_bytes
 
     def allocate(

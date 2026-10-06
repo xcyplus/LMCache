@@ -81,7 +81,7 @@ class InstanceLivenessTarget(Protocol):
     drives all targets from the PING handler and the reaper; no caller
     touches a module's private state directly.
     """
-
+# 刷新心跳
     def touch_instance(self, instance_id: int) -> None:
         """Refresh the worker's last-seen time and mark it ping-proven.
 
@@ -92,7 +92,7 @@ class InstanceLivenessTarget(Protocol):
             instance_id: The worker's opaque instance ID.
         """
         return
-
+# 回收超时实例
     def reap_stale_instances(
         self, reap_timeout_s: float, registration_grace_s: float
     ) -> list[int]:
@@ -112,11 +112,11 @@ class InstanceLivenessTarget(Protocol):
             that owns no liveness state.
         """
         return []
-
+# 当前跟踪数
     def tracked_instance_count(self) -> int:
         """Return the number of currently tracked instances (0 if none)."""
         return 0
-
+# 清理实例状态
     def drop_instance_state(self, instance_id: int) -> None:
         """Release any state mirrored for a reaped instance.
 

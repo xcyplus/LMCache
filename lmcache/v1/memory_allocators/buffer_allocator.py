@@ -15,7 +15,8 @@ from lmcache.v1.memory_management import (
     MemoryObj,
 )
 
-
+# BufferAllocator 用于分配和释放纯字节数据（BytesBufferMemoryObj）
+# ，不涉及 Tensor 的形状/dtype 转换，通常用于序列化后的 KV Cache 数据或通用字节缓冲区
 class BufferAllocator(MemoryAllocatorInterface):
     """Allocates memory in the pre-allocated pinned memory."""
 

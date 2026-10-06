@@ -187,9 +187,9 @@ class L1Manager:
     _gauge_target: "L1Manager | None" = None
 
     def __init__(self, config: L1ManagerConfig):
-        self._lock = threading.Lock()
+        self._lock = threading.Lock() # 申请了一个锁
 
-        self._objects: dict[ObjectKey, L1ObjectState] = {}
+        self._objects: dict[ObjectKey, L1ObjectState] = {}  # 一个字典  (key val)
 
         # GDS, Device-DAX, and CPU L1 are mutually exclusive tiers. Each tier
         # owns its backing allocator instead of branching inside the CPU path.
@@ -203,10 +203,10 @@ class L1Manager:
         else:
             self._memory_manager = L1MemoryManager(config.memory_config)
 
-        self._write_ttl_seconds = config.write_ttl_seconds
+        self._write_ttl_seconds = config.write_ttl_seconds  #TTL 锁的时限（防死锁的“保险丝”）  Time To Live（生存时间）
         self._read_ttl_seconds = config.read_ttl_seconds
 
-        self._registered_listeners: list[L1ManagerListener] = []
+        self._registered_listeners: list[L1ManagerListener] = []  #观察者模式，发生变化，主动通知订阅者
 
         self._event_bus = get_event_bus()
 
@@ -239,6 +239,16 @@ class L1Manager:
         with self._lock:
             self._registered_listeners.append(listener)
 
+    """ 为什么要加锁：
+
+    读锁告诉其他人“我正在读”。
+
+    期间对象不能被写（写锁和读锁互斥）。
+
+    期间对象不能被驱逐（is_key_evictable 会返回 False）。
+
+    读完必须调 finish_read 释放。 """
+
     @l1_mgr_synchronized
     def reserve_read(
         self,
@@ -270,7 +280,7 @@ class L1Manager:
         ret: dict[ObjectKey, L1OperationResult] = {}
         successful_keys: list[ObjectKey] = []
         for key in keys:
-            entry = self._objects.get(key, None)
+            entry = self._objects.get(key, None)   # 去字典里面查找
             if entry is None:
                 ret[key] = (L1Error.KEY_NOT_EXIST, None)
                 continue
@@ -435,6 +445,13 @@ class L1Manager:
 
         return ret
 
+# 为一批 key 预留写权限——已存在的加写锁，不存在的分配内存 + 创建 L1ObjectState + 加写锁
+    """ "new"：只处理不存在的对象（新建）。已存在的拒绝。
+
+    "update"：只处理已存在的对象（更新）。不存在的拒绝，不分配新内存。
+
+    "all"：都处理。 """
+
     @l1_mgr_synchronized
     def reserve_write(
         self,
@@ -442,9 +459,8 @@ class L1Manager:
         is_temporary: list[bool],
         layout_desc: MemoryLayoutDesc,
         mode: Literal["new", "update", "all"] = "all",
-    ) -> dict[ObjectKey, L1OperationResult]:
+    ) -> dict[ObjectKey, L1OperationResult]:   
         """Reserve write access for the given keys.
-
         Args:
             keys: The list of object keys to reserve write access for.
             is_temporary: The list of booleans indicating whether each key is

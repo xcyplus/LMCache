@@ -226,7 +226,7 @@ class BlendTokenRangeMatcherV3:
         self._lock = threading.Lock()
         # V3 addition: compact_chunk_id -> full poly hash, for collision reject.
         self._chunk_poly_hash: list[int] = []
-
+# 把一段已缓存序列的每个 chunk 记入哈希表，供后续查询匹配。
     def on_new_token_hashes(
         self,
         token_ids: list[int],
@@ -262,11 +262,13 @@ class BlendTokenRangeMatcherV3:
                 i
                 for i in range(start_chunk_idx, n)
                 if token_hashes[i] not in self._token_hash_to_compact_id
-            ]
+            ] #去重过滤（第 261-267 行） 
+            # 只登记 内容哈希没见过 的 chunk。
+            # `token_hashes` 是外部传入的内容哈希（真正的去重 key），不是这里算的 poly hash。
             if not new_idxs:
                 return
             n_new = len(new_idxs)
-            new_chunk_hashes = chunk_hashes[new_idxs]
+            new_chunk_hashes = chunk_hashes[new_idxs]  #花式索引，只选index是新下表里面的index
 
             base_id = len(self._chunk_token_hash)
             if base_id + n_new > self._TABLE_SIZE:
@@ -302,7 +304,7 @@ class BlendTokenRangeMatcherV3:
                 )
                 self._compact_id_to_slot[cid] = slot
                 self._token_hash_to_compact_id[th] = cid
-
+# 给定一个查询序列，找出其中哪些位置和已登记的某个 chunk 完全相同。
     def match_sub_sequence(
         self,
         token_ids: list[int],
@@ -1471,6 +1473,7 @@ class BlendV3Module(InstanceLivenessTarget):
             segmented_prefix_segments=segmented_tail,
         )
 
+# 劫持"了 STORE 请求
     def store(
         self,
         key: IPCCacheServerKey,
@@ -1642,7 +1645,7 @@ class BlendV3Module(InstanceLivenessTarget):
             )
             for m in matches
         ]
-
+#从队列取出 job，然后注册session 的指纹
     def _drain_fingerprint_queue(self) -> None:
         """Best-effort background drainer for _fingerprint_queue."""
         while not self._fingerprint_stop.is_set():

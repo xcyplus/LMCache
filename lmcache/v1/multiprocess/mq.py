@@ -489,7 +489,8 @@ class NonBlockingRequestHandler(Generic[ResponseType, StateType]):
     # TODO: implement this in the future versions if needed
     pass
 
-
+# LMCache MP 模式里 Server 端的 ZMQ 消息服务器。
+# 它接收 vLLM 客户端发来的请求（LOOKUP、STORE、RETRIEVE 等），分发到对应的 handler 处理，再把结果返回
 class MessageQueueServer:
     def __init__(self, bind_url: str, context: zmq.Context):
         # Socket
@@ -533,12 +534,18 @@ class MessageQueueServer:
             handler_entry (SyncRequestHandler[Any]): The handler entry.
             payloads (list[bytes]): The payloads of the request.
             prefix_frames (list[bytes]): The prefix frames to send back.
+        特点：
+            同步：主循环线程阻塞在这里，直到 handler 执行完、响应发出去。
+            无跨线程：不需要线程池、队列、通知器。
+            简单直接。
+            适合：快速、不阻塞的操作。
+            风险：如果 handler 慢，会阻塞主循环，其他请求都得排队等
         """
-        response = handler_entry(payloads)
-        response_cls = handler_entry.get_response_class()
-        b_response = msgspec_encode(response, cls=response_cls)
+        response = handler_entry(payloads)                      # 1. 直接调 handler
+        response_cls = handler_entry.get_response_class()       # 2. 取响应类型
+        b_response = msgspec_encode(response, cls=response_cls) # 3. 编码响应
         if response is not None:
-            self.socket.send_multipart(prefix_frames + [b_response])
+            self.socket.send_multipart(prefix_frames + [b_response])  # 4. 发回去
         else:
             self.socket.send_multipart(prefix_frames)
 
@@ -586,18 +593,19 @@ class MessageQueueServer:
         payloads: list[bytes],
         prefix_frames: list[bytes],
     ) -> Any:
-        match handler_entry.get_handler_type():
-            case HandlerType.SYNC:
-                assert isinstance(handler_entry, SyncRequestHandler)
-                self._call_sync_handler(handler_entry, payloads, prefix_frames)
-            case HandlerType.BLOCKING:
-                assert isinstance(handler_entry, BlockingRequestHandler)
-                self._call_blocking_handler(handler_entry, payloads, prefix_frames)
-            case HandlerType.NON_BLOCKING:
-                raise NotImplementedError("Non-blocking handler is not supported yet")
-            case _:
-                raise ValueError("Unknown handler type")
+            match handler_entry.get_handler_type():
+                case HandlerType.SYNC: #主循环直接执行，快，但慢操作会阻塞。
+                    assert isinstance(handler_entry, SyncRequestHandler)
+                    self._call_sync_handler(handler_entry, payloads, prefix_frames)   #典型操作 ：LOOKUP 等
+                case HandlerType.BLOCKING: #提交线程池执行，不阻塞主循环，适合慢操作。 
+                    assert isinstance(handler_entry, BlockingRequestHandler)
+                    self._call_blocking_handler(handler_entry, payloads, prefix_frames) #典型操作：STORE、RETRIEVE
+                case HandlerType.NON_BLOCKING:
+                    raise NotImplementedError("Non-blocking handler is not supported yet")
+                case _:
+                    raise ValueError("Unknown handler type")
 
+#主循环
     def _main_loop(self):
         output_fd = self._output_efd.fileno()
         while not self.is_finished.is_set():
@@ -616,7 +624,7 @@ class MessageQueueServer:
                 identity, b_request_uid, b_request_type, *payloads = msg
                 request_type = msgspec_decode(b_request_type, cls=RequestType)
 
-                if handler_entry := self.handlers.get(request_type):
+                if handler_entry := self.handlers.get(request_type): # ← 模块注册的handler表（拿到处理函数的句柄）
                     try:
                         self._call_handler(
                             handler_entry=handler_entry,
@@ -708,7 +716,7 @@ class MessageQueueServer:
             )
             return False
         return True
-
+ # 通用入口：先检查签名，再按类型分发
     def add_handler(
         self,
         request_type: RequestType,
@@ -739,7 +747,7 @@ class MessageQueueServer:
                 raise NotImplementedError("Non-blocking handler is not supported yet")
             case _:
                 raise ValueError(f"Unknown handler type: {handler_type}")
-
+# 同步线程注册
     def add_sync_handler(
         self, request_type: RequestType, payload_clss: list[Any], handler
     ) -> None:
@@ -747,7 +755,7 @@ class MessageQueueServer:
         self.handlers[request_type] = SyncRequestHandler(
             payload_clss, response_cls, handler
         )
-
+# 阻塞线程注册
     def add_blocking_handler(
         self, request_type: RequestType, payload_clss: list[Any], handler
     ) -> None:

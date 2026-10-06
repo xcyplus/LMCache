@@ -20,7 +20,7 @@ from lmcache.v1.memory_management import (
     logger,
 )
 
-
+# 动态切分，灵活，但每次分配要搜索，可能有碎片。
 class TensorMemoryAllocator(MemoryAllocatorInterface):
     """
     Implements a "explicit list" memory allocator.

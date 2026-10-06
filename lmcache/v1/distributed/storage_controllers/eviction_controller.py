@@ -48,7 +48,7 @@ class EvictionController(StorageControllerInterface):
             target=self.eviction_loop,
             daemon=True,
         )
-
+    # 起一个线程 持续开启驱逐 eviction_loop 循环
     def start(self):
         logger.info("Starting %s...", self.__class__.__name__)
         self._thread.start()
@@ -101,10 +101,10 @@ class L1EvictionController(EvictionController):
     ):
         super().__init__()
         self._eviction_config = eviction_config
-        self._eviction_policy = CreateEvictionPolicy(eviction_config)
+        self._eviction_policy = CreateEvictionPolicy(eviction_config)  #驱逐规则
         self._l1_manager = l1_manager
-        self._listener = L1EvictionPolicy(self._eviction_policy)
-        self._l1_manager.register_listener(self._listener)
+        self._listener = L1EvictionPolicy(self._eviction_policy)  
+        self._l1_manager.register_listener(self._listener)  
         self._event_bus = get_event_bus()
         self._last_extra_log = time.monotonic()
 
@@ -167,7 +167,7 @@ class L1EvictionController(EvictionController):
             if self._eviction_config.extra_logging_enabled:
                 self._maybe_log_memory_usage(used_bytes, total_bytes)
             usage = 0 if total_bytes == 0 else used_bytes / total_bytes
-            if usage < watermark:
+            if usage < watermark:            # 小于水线就暂时不用驱逐
                 logger.debug(
                     "L1 memory usage %.2f below watermark %.2f; skipping eviction.",
                     usage,
@@ -185,10 +185,10 @@ class L1EvictionController(EvictionController):
                 eviction_ratio,
                 key_eligible_filter=self._l1_manager.is_key_evictable,
             )
-            for action in actions:
+            for action in actions: # 
                 self.execute_eviction_action(action)
             self._publish_triggered(usage, watermark)
-
+    # 执行单次的驱逐动作
     def execute_eviction_action(self, action: EvictionAction):
         if action.destination == EvictionDestination.DISCARD:
             self._l1_manager.delete(action.keys)

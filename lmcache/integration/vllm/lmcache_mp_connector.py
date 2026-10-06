@@ -266,7 +266,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             vllm_config.kv_transfer_config.get_from_extra_config(
                 "lmcache.mp.eager_prefetch", False
             )
-        )
+        ) # 配置此项 可以让vllm 在wait 队列里面就发起前缀匹配查找
 
         # Multi-server: prefer lmcache.mp.server_urls (list or comma-separated
         # string) over the single-server lmcache.mp.host / lmcache.mp.port.
@@ -616,7 +616,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         self.worker_adapter.batched_submit_store_requests(
             request_ids, ops, event, cache_salts=cache_salts
-        )
+        )  #发送
         if self.dispatcher is not None:
             dispatch(self.dispatcher, "wait_for_save", event=event)
 

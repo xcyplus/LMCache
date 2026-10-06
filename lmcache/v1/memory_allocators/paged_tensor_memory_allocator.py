@@ -38,7 +38,7 @@ class PagedAddressManager:
         """Get the total free size in bytes."""
         return len(self._allocator.free_blocks) * self._allocator.align_bytes
 
-
+# 预先固定分页，分配极快、无碎片，但只能分配预定义好的形状。
 class PagedTensorMemoryAllocator(MemoryAllocatorInterface):
     """
     Implements a paged memory allocator.

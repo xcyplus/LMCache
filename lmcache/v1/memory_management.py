@@ -219,7 +219,7 @@ class MemoryObjMetadata:
             return get_size_bytes(self.shapes, self.dtypes)
         return self.shape.numel() * self.dtype.itemsize  # type: ignore
 
-
+# MemoryObj 是 LMCache 里所有内存对象的抽象基类，定义了“一块内存应该具备哪些能力”。具体实现由子类完成。
 class MemoryObj(metaclass=abc.ABCMeta):
     """
     MemoryObj interface.
@@ -460,6 +460,27 @@ class PinnedAllocFree:
         self.free_fn(ptr, *self.free_args)
 
 
+#   ┌──────────────┐        ┌──────────────┐
+#    │  NUMA 节点 0 │        │  NUMA 节点 1 │
+#    │  ┌────────┐  │        │  ┌────────┐  │
+#    │  │ 内存 0 │  │        │  │ 内存 1 │  │
+#    │  └────────┘  │        │  └────────┘  │
+#    │  ┌────────┐  │        │  ┌────────┐  │
+#    │  │ CPU 0  │  │        │  │ CPU 1  │  │
+#    │  └────────┘  │        │  └────────┘  │
+#    └──────┬───────┘        └───────┬──────┘
+#           │      互联（UPI/QPI）    │
+#           └────────────────────────┘
+# 每个 CPU 有自己的“本地内存”，组成一个 NUMA 节点。
+# CPU 0 访问内存 0（本地）快。
+# CPU 0 访问内存 1（远程）慢，要走 CPU 间互联。
+# 这就是“非统一”（Non-Uniform）：访问速度取决于内存相对于 CPU 的位置。
+# GPU 通过 PCIe 插在某个 CPU 的 PCIe 通道上，所以它和某个 NUMA 节点更近：
+# GPU 0 访问内存 0（本地）：走本地 PCIe，快。
+# GPU 0 访问内存 1（远程）：要走 CPU 间互联，慢。
+# 这里有3种内存
+#NUMA（Non-Uniform Memory Access，非统一内存访问）是多路服务器里的一种内存架构。核心特点是：CPU 访问不同位置的内存，速度不一样。
+#
 def _resolve_pinned_alloc_free(
     numa_mapping: Optional[NUMAMapping] = None,
     shm_name: Optional[str] = None,
@@ -544,7 +565,7 @@ def _read_hugepage_info() -> Optional[Tuple[int, int, int]]:
     except (OSError, ValueError):
         return None
 
-
+# 分配一个 CPU pin 内存，然后把其包装成tensor
 def _allocate_cpu_memory(
     size: int,
     numa_mapping: Optional[NUMAMapping] = None,
@@ -588,7 +609,8 @@ def _allocate_cpu_memory(
                     "Please grow the 2 MiB hugepage pool."
                 )
         raise
-
+# 裸指针 ptr → ctypes 数组（buffer protocol）→ torch.Tensor（零拷贝）
+#buffer protocol 是 Python 的底层协议，让对象能把自己的内存暴露给其他代码，实现零拷贝共享
     array_type = ctypes.c_uint8 * size
     buf = array_type.from_address(ptr)
     buffer = torch.frombuffer(buf, dtype=torch.uint8)
@@ -1172,6 +1194,7 @@ class GDSMemoryObject(MemoryObj):
 
 
 class MemoryAllocatorInterface(metaclass=abc.ABCMeta):
+# allocate：分配一个对象
     @abc.abstractmethod
     def allocate(
         self,
@@ -1193,7 +1216,7 @@ class MemoryAllocatorInterface(metaclass=abc.ABCMeta):
         :rtype: Optional[MemoryObj]
         """
         raise NotImplementedError
-
+#batched_allocate：批量分配
     @abc.abstractmethod
     def batched_allocate(
         self,
@@ -1217,7 +1240,7 @@ class MemoryAllocatorInterface(metaclass=abc.ABCMeta):
         :rtype: Optional[List[MemoryObj]]
         """
         raise NotImplementedError
-
+#释放一个对象
     @abc.abstractmethod
     def free(
         self,
@@ -1232,7 +1255,7 @@ class MemoryAllocatorInterface(metaclass=abc.ABCMeta):
         :param MemoryObj memory_obj: The MemoryObj to free.
         """
         raise NotImplementedError
-
+#批量释放
     @abc.abstractmethod
     def batched_free(
         self,
@@ -1247,7 +1270,8 @@ class MemoryAllocatorInterface(metaclass=abc.ABCMeta):
             to free.
         """
         raise NotImplementedError
-
+#关闭”指的是释放分配器持有的底层资源 （不是所有分配器都需要显式释放资源）
+#子类不实现抽象方法 → 子类自己也是抽象的 → 不能实例化。
     def close(self):
         """
         Closes the memory allocator.

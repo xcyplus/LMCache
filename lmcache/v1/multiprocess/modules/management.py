@@ -133,7 +133,7 @@ class ManagementModule:
         """Stop the reaper, if one is running."""
         if self._reaper is not None:
             self._reaper.stop()
-
+# worker 定期发的心跳，刷新它在各 liveness target 里的“最后活跃时间”
     def ping(self, instance_id: int | None) -> bool:
         """Respond to a ping and refresh the sender's liveness.
 
@@ -168,7 +168,7 @@ class ManagementModule:
             for target in self._liveness_targets:
                 target.drop_instance_state(instance_id)
         return ThreadRunSummary(success=True, message=f"reaped={len(reaped)}")
-
+# 返回 chunk 大小（如 256），vLLM 侧初始化时要对齐
     def get_chunk_size(self) -> int:
         """Return the chunk size used for KV cache operations.
 
@@ -176,7 +176,7 @@ class ManagementModule:
             The chunk size.
         """
         return self._ctx.chunk_size
-
+# 查询服务端开启了哪些实验性传输功能
     def get_experimental(self) -> list[str]:
         """Return the experimental intermediate tensor transfer built in the
         server.
@@ -186,7 +186,7 @@ class ManagementModule:
             See ``lmcache.v1.multiprocess.modules.experimental.__init__``.
         """
         return list(self._experimental_transfer)
-
+# 清空整个存储（`memcheck → clear(force=True) → memcheck` ），用`_clear_lock` 防止并发清两次
     def clear(self) -> None:
         """Clear all stored KV cache data from the storage manager."""
         with self._clear_lock:
