@@ -135,6 +135,10 @@ class LMCacheEngineConfig:
     # When set, uses external lookup client instead of regular lookup server
     external_lookup_client: Optional[str] = None
 
+    # RAG metadata (url -> text) file used by UrlSegmentTokenDatabase to
+    # locate text segments without separators in the prompt
+    rag_db_path: Optional[str] = None
+
     @staticmethod
     def from_defaults(
         chunk_size: int = 256,
@@ -180,6 +184,7 @@ class LMCacheEngineConfig:
         save_unfull_chunk: bool = True,
         blocking_timeout_secs: int = 10,
         external_lookup_client: Optional[str] = None,
+        rag_db_path: Optional[str] = None,
     ) -> "LMCacheEngineConfig":
         # TODO (ApostaC): Add nixl config
         return LMCacheEngineConfig(
@@ -226,6 +231,7 @@ class LMCacheEngineConfig:
             save_unfull_chunk,
             blocking_timeout_secs,
             external_lookup_client,
+            rag_db_path,
         ).validate()
 
     @staticmethod
@@ -402,6 +408,8 @@ class LMCacheEngineConfig:
 
         external_lookup_client = config.get("external_lookup_client", None)
 
+        rag_db_path = config.get("rag_db_path", None)
+
         local_disk_path = _parse_local_disk(local_disk)
 
         match remote_url:
@@ -457,6 +465,7 @@ class LMCacheEngineConfig:
                 save_unfull_chunk,
                 blocking_timeout_secs,
                 external_lookup_client,
+                rag_db_path,
             )
             .validate()
             .log_config()
@@ -674,6 +683,9 @@ class LMCacheEngineConfig:
         config.external_lookup_client = parse_env(
             get_env_name("external_lookup_client"), config.external_lookup_client
         )
+        config.rag_db_path = parse_env(
+            get_env_name("rag_db_path"), config.rag_db_path
+        )
         return config.validate().log_config()
 
     def to_original_config(self) -> orig_config.LMCacheEngineConfig:
@@ -757,6 +769,7 @@ class LMCacheEngineConfig:
             "save_unfull_chunk": self.save_unfull_chunk,
             "blocking_timeout_secs": self.blocking_timeout_secs,
             "external_lookup_client": self.external_lookup_client,
+            "rag_db_path": self.rag_db_path,
         }
         logger.info(f"LMCache Configuration: {config_dict}")
 

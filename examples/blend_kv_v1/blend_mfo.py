@@ -19,7 +19,7 @@ from lmcache.v1.cache_engine import LMCacheEngineBuilder
 
 
 def setup_environment_variables(
-    use_disk: bool = False, blend_special_str: str = " # # "
+    use_disk: bool = False, rag_db_path: Optional[str] = None
 ):
     # LMCache-related environment variables
 
@@ -28,7 +28,10 @@ def setup_environment_variables(
 
     # Blending related config
     os.environ["LMCACHE_ENABLE_BLENDING"] = "True"
-    os.environ["LMCACHE_BLEND_SPECIAL_STR"] = blend_special_str
+    # 用 url 元数据定位文本区间，prompt 中不再插入分隔符
+    if rag_db_path is not None:
+        # 名称必须与 config.from_env 的 get_env_name("rag_db_path") 一致
+        os.environ["LMCACHE_RAG_DB_PATH"] = os.path.abspath(rag_db_path)
     os.environ["LMCACHE_USE_LAYERWISE"] = "True"
 
     if use_disk:
@@ -100,16 +103,16 @@ def parse_args():
     )
 
     parser.add_argument(
-        "-b",
-        "--blend-special-str",
-        default="# #",
-        help="Specify the special separators to separate chunks (default: '# #')",
-    )
-
-    parser.add_argument(
         "--model",
         default="mistralai/Mistral-7B-Instruct-v0.2",
         help="Path or name of the model to use",
+    )
+
+    parser.add_argument(
+        "--rag-db",
+        default=None,
+        help="Path to the RAG database (url -> text) JSON file "
+        "(default: rag_db.json next to this script)",
     )
 
     return parser.parse_args()
@@ -153,15 +156,21 @@ def main():
     lmcache_connector = "LMCacheConnectorV1"
     model = args.model
 
-    setup_environment_variables(args.use_disk, args.blend_special_str)
+    rag_db_path = args.rag_db or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "rag_db.json"
+    )
+
+    setup_environment_variables(args.use_disk, rag_db_path)
 
     tokenizer = AutoTokenizer.from_pretrained(model)
-    rag_data_geter = RAG_Database()
+    rag_data_geter = RAG_Database(rag_db_path)
 
     with build_llm_with_lmcache(lmcache_connector, model) as llm:
         # This example script runs two requests that share non-prefix chunks
         # to test CacheBlend's content-addressing (order-independent matching).
+        # 文本区间由 url 元数据（rag_db.json）定位，prompt 中不插入分隔符。
         sys_prompt = tokenizer.encode("You are a very helpful assistant.")
+        query_prompt = tokenizer.encode("请用一句话总结上述城市的特点。")[1:]
 
         # Load two documents from RAG database
         beijing_text = rag_data_geter.get_text("www.beijing.com")
@@ -170,31 +179,13 @@ def main():
         beijing_prompt = tokenizer.encode(beijing_text)[1:]
         chongqing_prompt = tokenizer.encode(chongqing_text)[1:]
 
-        blend_special_str = tokenizer.encode(os.getenv("LMCACHE_BLEND_SPECIAL_STR"))[1:]
+        # First request: [sys][beijing][chongqing][question]
+        first_prompt = sys_prompt + beijing_prompt + chongqing_prompt + query_prompt
 
-        # First request: [sys] sep [beijing] sep [chongqing] sep [question]
-        first_prompt = (
-            sys_prompt
-            + blend_special_str
-            + beijing_prompt
-            + blend_special_str
-            + chongqing_prompt
-            + blend_special_str
-            + tokenizer.encode("请用一句话总结上述城市的特点。")[1:]
-        )
-
-        # Second request: [sys] sep [chongqing] sep [beijing] sep [question]
+        # Second request: [sys][chongqing][beijing][question]
         # The two document chunks are swapped — CacheBlend should still hit them
         # via content-addressing rather than prefix matching.
-        second_prompt = (
-            sys_prompt
-            + blend_special_str
-            + chongqing_prompt
-            + blend_special_str
-            + beijing_prompt
-            + blend_special_str
-            + tokenizer.encode("请用一句话总结上述城市的特点。")[1:]
-        )
+        second_prompt = sys_prompt + chongqing_prompt + beijing_prompt + query_prompt
 
         sampling_params = SamplingParams(temperature=0, top_p=0.95, max_tokens=200)
 
