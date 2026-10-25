@@ -419,6 +419,9 @@ class UrlSegmentTokenDatabase(TokenDatabase):
     ):
         super(UrlSegmentTokenDatabase, self).__init__(config, metadata)
 
+        # chunk_size 不放在基类，这里从 config 取（与 ChunkedTokenDatabase 一致）
+        self.chunk_size = config.chunk_size if config is not None else 256
+
         assert metadata is not None, "metadata is required for UrlSegmentTokenDatabase"
         self.tokenizer = AutoTokenizer.from_pretrained(metadata.model_name)
 
