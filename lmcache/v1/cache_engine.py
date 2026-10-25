@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from collections import defaultdict
-from typing import Dict, Generator, List, Optional, Union
+from typing import Dict, Generator, List, Optional, Tuple, Union
 import asyncio
 import multiprocessing
 import time
@@ -39,6 +39,7 @@ from lmcache.v1.token_database import (
     ChunkedTokenDatabase,
     SegmentTokenDatabase,
     TokenDatabase,
+    UrlSegmentTokenDatabase,
 )
 
 logger = init_logger(__name__)
@@ -666,7 +667,9 @@ class LMCacheEngine:
                 search_range is None or "p2p" in search_range
             )
 
-            for start, end, key in self.token_database.process_tokens(tokens=tokens):
+            for start, end, key in self.token_database.process_tokens(
+                tokens=tokens, request_id=request_id
+            ):
                 assert isinstance(key, CacheEngineKey)
 
                 if self.use_layerwise:
@@ -712,6 +715,69 @@ class LMCacheEngine:
             if pin:
                 self.storage_manager.touch_cache()
 
+    # ------------------------------------------------------------------
+    # 文章级元数据管理（仅当 token_database 为 UrlSegmentTokenDatabase 时生效）
+    # ------------------------------------------------------------------
+
+    def _release_article_refs(self, request_ids: List[str]) -> None:
+        """按 process_tokens 记录的引用次数成对扣减文章引用计数。"""
+        if not isinstance(self.token_database, UrlSegmentTokenDatabase):
+            return
+        for request_id in request_ids:
+            for url, count in self.token_database.clear_request(request_id).items():
+                self.token_database.dec_ref(url, count)
+
+    def _remove_chunk(self, chunk_hash: int) -> None:
+        """驱逐一个 chunk 的 KV cache（layerwise 模式下需按层拆分 key）。"""
+        key = self.token_database._make_key_by_hash(chunk_hash)
+        if self.use_layerwise:
+            for layer_key in key.split_layers(self.num_layers):
+                self.storage_manager.remove(layer_key)
+        else:
+            self.storage_manager.remove(key)
+
+    def refresh_article(self, url: str, new_text: str) -> Tuple[List[int], List[int]]:
+        """刷新某篇文章的内容，返回 (新增 hash 列表, 失效 hash 列表)。
+
+        失效的 hash 会被立即从 L2 驱逐；新增的 hash 在下次请求时自然 miss
+        并重新计算存储。仅在使用 UrlSegmentTokenDatabase 时有意义。
+        """
+        if not isinstance(self.token_database, UrlSegmentTokenDatabase):
+            logger.warning(
+                "refresh_article is only supported with UrlSegmentTokenDatabase"
+            )
+            return [], []
+        fresh, stale = self.token_database.refresh_article(url, new_text)
+        for chunk_hash in stale:
+            self._remove_chunk(chunk_hash)
+        return fresh, stale
+
+    def remove_article(self, url: str) -> None:
+        """删除某篇文章的元数据并驱逐其所有 KV cache。"""
+        if not isinstance(self.token_database, UrlSegmentTokenDatabase):
+            return
+        chunk_hashes = self.token_database.remove_article(url)
+        if chunk_hashes is None:
+            return
+        for chunk_hash in chunk_hashes:
+            self._remove_chunk(chunk_hash)
+
+    def get_article(self, url: str):
+        """查询某篇文章的元数据（不存在返回 None）。"""
+        if isinstance(self.token_database, UrlSegmentTokenDatabase):
+            return self.token_database.get_article(url)
+        return None
+
+    def set_request_urls(self, request_id: str, urls: List[str]) -> None:
+        """注册某请求的有序 url 列表，启用引导匹配（避免全库扫描）。
+
+        上层（如 RAG 网关）在提交请求前调用，传入该请求 prompt 由哪些 url
+        拼接而成。这样 process_tokens 只需匹配这些 url（通常 2-5 个），
+        而不是全库扫描。
+        """
+        if isinstance(self.token_database, UrlSegmentTokenDatabase):
+            self.token_database.set_request_urls(request_id, urls)
+
     @_lmcache_nvtx_annotate
     def move(
         self,
@@ -725,46 +791,52 @@ class LMCacheEngine:
         Perform cross-node move of the KV cache.
         """
 
-        num_tokens = self.lookup(
-            tokens,
-            search_range=old_position,
-            request_id=event_id,
-            pin=True,
-        )
-
-        if not num_tokens:
-            logger.debug("Move is not performed as there are no tokens to move.")
-            return 0
-
-        keys = self.lookup_pins[event_id]
-
-        memory_objs = self.storage_manager.batched_get(
-            keys=keys,
-            location=old_position,
-        )
-        logger.debug(
-            f"Trying to send {len(memory_objs)} memory objects to {new_position}"
-        )
-
-        future = asyncio.run_coroutine_threadsafe(
-            self.distributed_server.batched_issue_put(
-                keys, memory_objs, new_position[0], new_position[1]
-            ),
-            self.distributed_loop,
-        )
-
-        future.add_done_callback(lambda f: [m.unpin() for m in memory_objs])
-
-        if not do_copy:
-            remove_callback = lambda f: self.storage_manager.batched_remove(
-                keys, locations=[old_position]
+        try:
+            num_tokens = self.lookup(
+                tokens,
+                search_range=old_position,
+                request_id=event_id,
+                pin=True,
             )
-            future.add_done_callback(remove_callback)
 
-        future.result()
+            if not num_tokens:
+                logger.debug("Move is not performed as there are no tokens to move.")
+                return 0
 
-        logger.debug(f"Moving {num_tokens} token from {old_position} to {new_position}")
-        return num_tokens
+            keys = self.lookup_pins[event_id]
+
+            memory_objs = self.storage_manager.batched_get(
+                keys=keys,
+                location=old_position,
+            )
+            logger.debug(
+                f"Trying to send {len(memory_objs)} memory objects to {new_position}"
+            )
+
+            future = asyncio.run_coroutine_threadsafe(
+                self.distributed_server.batched_issue_put(
+                    keys, memory_objs, new_position[0], new_position[1]
+                ),
+                self.distributed_loop,
+            )
+
+            future.add_done_callback(lambda f: [m.unpin() for m in memory_objs])
+
+            if not do_copy:
+                remove_callback = lambda f: self.storage_manager.batched_remove(
+                    keys, locations=[old_position]
+                )
+                future.add_done_callback(remove_callback)
+
+            future.result()
+
+            logger.debug(
+                f"Moving {num_tokens} token from {old_position} to {new_position}"
+            )
+            return num_tokens
+        finally:
+            # 该 event 不会再走到 lookup_unpin，这里显式释放文章引用
+            self._release_article_refs([event_id])
 
     # TODO(Jiayi): Need to handle the case where `tokens=None`.
     # In this case, we compress all tokens.
@@ -789,38 +861,42 @@ class LMCacheEngine:
 
         serializer, _ = CreateSerde(method, self.metadata, self.config)
 
-        num_tokens = self.lookup(
-            tokens,
-            search_range=[location],
-            request_id=event_id,
-            pin=True,
-        )
+        try:
+            num_tokens = self.lookup(
+                tokens,
+                search_range=[location],
+                request_id=event_id,
+                pin=True,
+            )
 
-        if not num_tokens:
-            logger.debug("Move is not performed as there are no tokens to move.")
-            return 0
+            if not num_tokens:
+                logger.debug("Move is not performed as there are no tokens to move.")
+                return 0
 
-        keys = self.lookup_pins[event_id]
+            keys = self.lookup_pins[event_id]
 
-        memory_objs = self.storage_manager.batched_get(
-            keys=keys,
-            location=location,
-        )
+            memory_objs = self.storage_manager.batched_get(
+                keys=keys,
+                location=location,
+            )
 
-        compressed_memory_objs = []
-        for memory_obj in memory_objs:
-            compressed_memory_obj = serializer.serialize(memory_obj)
-            memory_obj.unpin()
-            compressed_memory_objs.append(compressed_memory_obj)
-        self.storage_manager.batched_put(
-            keys=keys,
-            memory_objs=compressed_memory_objs,
-            location=location,
-        )
+            compressed_memory_objs = []
+            for memory_obj in memory_objs:
+                compressed_memory_obj = serializer.serialize(memory_obj)
+                memory_obj.unpin()
+                compressed_memory_objs.append(compressed_memory_obj)
+            self.storage_manager.batched_put(
+                keys=keys,
+                memory_objs=compressed_memory_objs,
+                location=location,
+            )
 
-        self.storage_manager.batched_remove(memory_objs, locations=[location])
+            self.storage_manager.batched_remove(memory_objs, locations=[location])
 
-        return num_tokens
+            return num_tokens
+        finally:
+            # 该 event 不会再走到 lookup_unpin，这里显式释放文章引用
+            self._release_article_refs([event_id])
 
     @_lmcache_nvtx_annotate
     def lookup_unpin(self, request_ids: list[str]) -> None:
@@ -828,6 +904,8 @@ class LMCacheEngine:
             if request_id in self.lookup_pins:
                 self.storage_manager.batched_unpin(self.lookup_pins[request_id])
                 del self.lookup_pins[request_id]
+        # 请求结束，对该请求引用的所有文章做引用计数 -1（按次数成对扣减）
+        self._release_article_refs(request_ids)
 
     @_lmcache_nvtx_annotate
     def clear(
@@ -924,6 +1002,9 @@ class LMCacheEngineBuilder:
         metadata: LMCacheEngineMetadata,
     ) -> TokenDatabase:
         if config.enable_blending:
+            # 配置了 RAG 元数据时，用 url 定位区间，prompt 中不再需要分隔符
+            if config.rag_db_path is not None:
+                return UrlSegmentTokenDatabase(config, metadata)
             return SegmentTokenDatabase(config, metadata)
         return ChunkedTokenDatabase(config, metadata)
 

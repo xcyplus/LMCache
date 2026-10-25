@@ -49,10 +49,17 @@ class MooncakeLookupClient(LookupClientInterface):
         )
 
         # First Party
-        from lmcache.v1.token_database import ChunkedTokenDatabase, SegmentTokenDatabase
+        from lmcache.v1.token_database import (
+            ChunkedTokenDatabase,
+            SegmentTokenDatabase,
+            UrlSegmentTokenDatabase,
+        )
 
         if config.enable_blending:
-            self.token_database = SegmentTokenDatabase(config, metadata)
+            if config.rag_db_path is not None:
+                self.token_database = UrlSegmentTokenDatabase(config, metadata)
+            else:
+                self.token_database = SegmentTokenDatabase(config, metadata)
         else:
             self.token_database = ChunkedTokenDatabase(config, metadata)
 
