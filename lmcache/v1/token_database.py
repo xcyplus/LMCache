@@ -435,6 +435,11 @@ class UrlSegmentTokenDatabase(TokenDatabase):
         self._request_urls: dict[str, dict[str, int]] = {}
         # request_id -> 上层传入的有序 url 列表（引导匹配，避免全库扫描）
         self._request_input_urls: dict[str, List[str]] = {}
+        # url -> 累计命中次数（process_tokens 每次匹配到该 url 时 +1），
+        # 供 ③ Proactive Refresh 按热度挑选后台刷新候选
+        self.url_access_counts: dict[str, int] = {}
+        # url -> 最近一次命中时间戳（热度 tie-break / 新鲜度参考）
+        self.url_last_access: dict[str, float] = {}
         # url -> 该 url 的 token 变体列表（带 BOS / 去 BOS），用于引导匹配
         self._url_variants: dict[str, List[List[int]]] = {}
         # 按首 token建索引：匹配时只查首 token 相同的条目。
@@ -649,8 +654,11 @@ class UrlSegmentTokenDatabase(TokenDatabase):
         if request_id is not None and matched_urls:
             with self._lock:
                 ref_counts = self._request_urls.setdefault(request_id, {})
+                now = time.time()
                 for url in matched_urls:
                     ref_counts[url] = ref_counts.get(url, 0) + 1
+                    self.url_access_counts[url] = self.url_access_counts.get(url, 0) + 1
+                    self.url_last_access[url] = now
                     article = self.articles.get(url)
                     if article is not None:
                         article.ref_cnt += 1
@@ -703,6 +711,50 @@ class UrlSegmentTokenDatabase(TokenDatabase):
         """查询某段 KV cache 对应的来源 url"""
         with self._lock:
             return self.hash_to_url.get(chunk_hash)
+
+    def get_url_access_count(self, url: str) -> int:
+        """查询某 url 的累计命中次数（热度，供 ③ Proactive Refresh 调度）。"""
+        with self._lock:
+            return self.url_access_counts.get(url, 0)
+
+    def get_hot_urls(self, top_k: Optional[int] = None) -> List[Tuple[str, int]]:
+        """按热度降序返回 [(url, count)]，仅含命中过的 url。
+
+        供主动刷新决定"哪些文档值得后台刷新"时使用：Web RAG 的 url
+        访问天然近似 Zipf，热度排序即贪心调度的优先级。
+        """
+        with self._lock:
+            items = [
+                (url, cnt) for url, cnt in self.url_access_counts.items() if cnt > 0
+            ]
+        items.sort(key=lambda item: (-item[1], item[0]))
+        if top_k is not None:
+            items = items[:top_k]
+        return items
+
+    def compute_refresh_chunks(
+        self, text: str, include_bos_variant: bool = True
+    ) -> List[Tuple[List[int], int]]:
+        """按与 refresh_article 完全一致的规则切块，返回 [(token_ids, hash)]。
+
+        后台盲编码执行器用它定位"哪些 chunk 的 KV 需要重算"：只对 hash
+        落在 fresh 集合中的 chunk 独立 prefill，未变 chunk 保持不动，
+        这就是 ② Incremental Update 在后台路径上的增量红利。
+        """
+        ids = self.tokenizer.encode(text)
+        variants: List[List[int]] = [list(ids)]
+        if len(ids) > 1 and include_bos_variant:
+            variants.append(list(ids[1:]))
+        out: List[Tuple[List[int], int]] = []
+        seen: set[int] = set()
+        for v in variants:
+            for i in range(0, len(v), self.chunk_size):
+                chunk = v[i : i + self.chunk_size]
+                h = self._hash_tokens(chunk)
+                if h not in seen:
+                    seen.add(h)
+                    out.append((list(chunk), h))
+        return out
 
     def refresh_article(
         self, url: str, new_text: str
