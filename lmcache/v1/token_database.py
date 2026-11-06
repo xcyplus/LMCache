@@ -762,7 +762,11 @@ class UrlSegmentTokenDatabase(TokenDatabase):
         """刷新某篇文章的内容，返回 (新增的 hash 列表, 失效的 hash 列表)。
 
         调用方拿到失效 hash 列表后，应主动调用 storage_manager.remove 驱逐
-        对应的 KV cache；新增的 hash 在下次请求命中时自然 miss 并重算存储。
+        对应的 KV cache。
+
+        新增的 hash 此时尚无 KV（本函数只做失效与登记，不重算）：
+        被动模式下，下次请求 lookup 这些 hash 会 miss，由请求路径重算存储；
+        若配合 ③ ProactiveRefresh 在空闲窗口后台盲编码，则下次请求直接命中。
         """
         new_ids = self.tokenizer.encode(new_text)
         # 同时考虑带 BOS 与去 BOS 两种形式（与 __init__ 加载逻辑一致）
