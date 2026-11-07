@@ -296,10 +296,13 @@
 | 论文位置 | 填什么 | 数据 |
 |---|---|---|
 | §5.2 表1 | post/0、miss、bg_tokens、F1、flip | norefresh 0.25s/1452 vs proactive 0.11s/0 |
-| §5.3 表2 | 暂留空或标注"调整中" | 三排序无区分度，需重跑 |
+| §5.3 表2 | 排序对比被 buffer bug 阻碍；改为预算/后台成本 + 形式化讨论，排序留作未来工作（§4.4） | proactive bg_tokens=490140（vs proactive_full 305740） |
 | §5.4 表3 | fresh/stale/total，级联=5.21 块/文档 | len 14.46 vs iso 9.25 |
 | §5.6 motivation | ttft/bg_tokens/flip | proactive 0.085s/flip=True vs norefresh 0.16s/flip=False |
 | §5.1 环境 | GPU 型号、N | RTX 4080 SUPER 32GB，N=200 |
+| §5.5 质量 | F1 pre/0 vs pre/1 | 0.4174 vs 0.4174，p=1.0，复用无损 |
+| §5.5 granularity | question vs paragraph | question 全命中(miss=0)，paragraph 编辑机制不同待研究 |
+| §2.3 flip 论据 | 盲编码失真实证 | qid 5ac1a4 三策略答不同数字，内容一致≠注意力一致 |
 
 **headline 数据**（摘要用）：更新后首请求 TTFT 由 0.25s 降至 0.11s（降低 56%），miss token 由 1452 降至 0（全命中）；motivation 单文档场景答案正确翻转（flip=True），新鲜度保证成立。
 
