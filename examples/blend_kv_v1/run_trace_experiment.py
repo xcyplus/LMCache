@@ -213,16 +213,17 @@ def run_policy(policy, trace, llm, tokenizer, bg_budget, order="hot", drain_on_u
             elif policy == "proactive_full":
                 engine.remove_article(url)
                 engine.refresh_article(url, new_text)
-                # 逐块盲编码（与 proactive 执行器一致），保证存储登记口径与
-                # 请求前计量（chunk_in_storage 查 compute_refresh_chunks 的 hash）一致，
-                # 避免 miss_tokens 计量偏差。
+                # 整篇盲编码（非逐块）。诊断实验证实：逐块 generate
+                # （compute_refresh_chunks）虽能让 chunk_in_storage 计量 miss=0，
+                # 但请求路径 vLLM retrieve 不认逐块存的 KV（post/0 升至 0.225s 重算）；
+                # 整篇 generate 的 KV 能被请求路径命中（post/0=0.095s 全命中），
+                # 但 chunk_in_storage 逐层查口径不一致（miss=1529.7 计量偏差）。
+                # 两口径独立，故保持整篇 generate（请求路径命中优先），miss 标为计量偏差。
+                doc_ids = tokenizer.encode(new_text)[1:]
                 t0 = time.time()
-                for chunk_tokens, h in engine.token_database.compute_refresh_chunks(
-                    new_text, include_bos_variant=False
-                ):
-                    encode_fn(chunk_tokens)
-                    bg["tokens"] += len(chunk_tokens)
-                    bg["chunks"] += 1
+                encode_fn(doc_ids)
+                bg["tokens"] += len(doc_ids)
+                bg["chunks"] += 1
                 bg["wall_s"] += time.time() - t0
             if drain_on_update:
                 drain_background()

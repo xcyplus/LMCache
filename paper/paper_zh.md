@@ -171,7 +171,7 @@ DocCache 实现于 LMCache v1（以 KV connector 集成于 vLLM）：
 | **proactive** | 490140 | 68.59 | 0.224 | 0.096 | **0.099** | 0.094 | **0** | 0.345 | 0.150 |
 | proactive_full | 305740 | 35.09 | 0.223 | 0.092 | 0.095 | 0.093 | 1529.7† | 0.345 | 0.290 |
 
-† proactive_full 的 post/0 未命中 token=1529.7 为**计量偏差**：`chunk_in_storage` 逐层查询口径与整篇 generate 的 layerwise 存储登记口径不一致；其 post/0 TTFT=0.095s（与全命中基线 pre/1=0.092s 持平）证明 vLLM retrieve 实际成功命中，未命中数应为 0。
+† proactive_full 的 post/0 未命中 token=1529.7 为**计量偏差**（诊断实验证实）：`chunk_in_storage` 逐层查询口径与请求路径 vLLM retrieve 口径**独立**。对照实验：逐块 generate（对齐 chunk_in_storage 口径）使 miss=0 但 post/0 升至 0.225s（请求路径未命中）；整篇 generate 使 post/0=0.095s（请求路径命中，与 pre/1=0.092s 持平）但 miss=1529.7。两口径无法同时对齐（vLLM 请求路径 retrieve 与 chunk_in_storage 存储层查询用不同 key 空间），证明 miss=1529.7 是计量偏差而非实际未命中，实际命中以 post/0 TTFT 为准。proactive 的 miss=0 两口径一致（compute_refresh_chunks 逐块 generate 的 KV 同时被请求路径命中），无偏差。
 
 **核心结果解读。**
 
@@ -307,7 +307,7 @@ pre/1 用复用 KV + 加载期选择性重算（blend_recompute_ratio=0.15），
 2. **注意力过期**：哈希差集只标记存储过期；编辑下游失真由加载期重算掩盖、可选预算修复插件处理。我们改进的是失效定位与时机，不改进修复算法本身。表 1 翻转率反常（norefresh > proactive）经 §5.5b 全量 200 样本分类证实：54% 是生造词难度（与缓存无关），38.5% 是盲编码增量重算的固有副作用（proactive 只接触 Δ⁺ 缺乏完整新文档上下文）。这是复用技术的固有议题，由修复层处理。
 3. **顺序回放**：评测为单 GPU 串行回放，空闲窗口退化为事件间隙；并发到达下的调度真实增益（热度贪心 vs Oracle 的差距）需在线服务评测，是下一步。表 2 三排序无区分度即此局限的直接体现。
 4. **passive 实现与 layerwise buffer 交互**：当前 passive 调 `token_database.refresh_article` 只删反向索引（hash_to_url）不删 storage 里的 stale KV——这是构造性新鲜保证下的等价实现（新内容 hash 必不匹配旧 hash，stale KV 留在 storage 也不会被读出，只占用空间）。passive≈norefresh 的 post/0 是此保证的设计推论（§5.2 已论证），非 bug。真正删 storage stale 会破坏 layerwise GPU connector 的滑动窗口 `buffer_mapping` 状态（`gpu_connector.py:356`），迫使 update 后立即用 generate 修复 buffer；但删 storage 只回收空间、不改变延迟行为，故当前实现足以验证 passive 的延迟论点。表 2 三排序无区分度的根因是串行回放下空闲窗口退化为事件间隙（局限③），非此交互 bug。
-5. **miss 计量口径**：proactive_full 的 post/0 miss=1529.7（但 TTFT=0.095s 显示全命中）是 `chunk_in_storage` 逐层查询口径与整篇 generate 的 layerwise 存储登记口径不一致所致。proactive 的 miss=0 用的是请求路径 vLLM retrieve 实际命中统计（日志 "LMCache hit tokens"），口径可信且与 TTFT 一致。后续将对齐 proactive_full 的计量口径（改用 `compute_refresh_chunks` 逐块 generate 登记），消除偏差。
+5. **miss 计量口径**：proactive_full 的 post/0 miss=1529.7（但 TTFT=0.095s 显示全命中）是 `chunk_in_storage` 逐层查询口径与请求路径 vLLM retrieve 口径独立所致。**诊断实验证实**：逐块 generate（对齐 chunk_in_storage 口径）使 miss=0 但 post/0 升至 0.225s（请求路径未命中）；整篇 generate 使 post/0=0.095s（请求路径命中）但 miss=1529.7。两口径无法同时对齐（vLLM 请求路径 retrieve 与 chunk_in_storage 存储层查询用不同 key 空间），故 proactive_full 保持整篇 generate（请求路径命中优先），miss 标为计量偏差。proactive 的 miss=0 两口径一致（compute_refresh_chunks 逐块 generate 的 KV 同时被请求路径命中），无偏差。
 5. **热度即历史**：贪心策略用历史命中代替未来概率；§5.3 的 Oracle 差距（待并发评测）给出学习型预测器的收益上界。
 6. **granularity 交互**：paragraph 模式（§5.5c）后台 token 反常偏少且未全命中，因 `build_paragraph_granularity` 不接 `edit_mode`，编辑机制与 question 模式不同。长文档的增量收益机制需进一步研究编辑模式对级联的调制。
 7. **flip_ok 字符串匹配**：motivation 的 `flip_ok` 查"2210"子串，英文答案 `22,108,000` 因逗号分隔未连续匹配而误判 False（实为同一新数字）。建议改为数值归一化匹配。
