@@ -243,6 +243,54 @@
 
 ---
 
+## 补充实验（第二轮：质量 + flip 根因 + 表2 局限）
+
+### F1 质量对比（pre/0 冷启动 vs pre/1 复用，N=100 block）
+
+为验证论文摘要"答案质量与冷启动全量预填充无可测差异"，改 `run_trace_experiment` 让 pre/1 也生成答案，对比 pre/0（冷启动全量重算）与 pre/1（复用+blend retrieve）的 F1。
+
+| 指标 | pre/0（冷启动） | pre/1（复用） | 结论 |
+|---|---|---|---|
+| mean F1 | 0.4174 | 0.4174 | **100 题全部完全相同** |
+| mean EM | 0.2000 | 0.2000 | 相同 |
+| 配对差值 | mean=0, std=0 | — | p=1.0，复用无损 |
+
+**结论**：复用（blend retrieve）完全不损质量——pre/1 用复用 KV + 加载期选择性重算，答案与 pre/0 全量重算一字不差。支撑论文 §5.5 + 摘要"答案质量与冷启动全量预填充无可测差异"。
+
+### flip 反转根因（抽样核对，N=200 post/0 answer）
+
+表1 flip 反转 norefresh(0.355) > proactive(0.155)。抽样 6 个 qid 对比三策略 post/0 答案：
+
+- 多数题三策略答案**完全相同**（缓存方式不影响）
+- qid `5ac1a4`：norefresh 答"Zyxoria people"（翻转）、proactive 答"120,000 people"、proactive_full 答"150,000 people"——**三策略答出不同数字，盲编码注意力失真的直接证据**
+- qid `5a7133`：proactive 也正确翻转（答"Zyxoria"）
+
+**结论**：flip 反转 = 部分盲编码注意力失真 + 部分生造词难度。这**实证了论文 §2.3"内容一致 ≠ 注意力一致"论点**——DocCache 是存储层+调度层，注意力失真由修复层（CacheBlend 加载期重算）处理，非本文职责。可作为论文论据而非缺陷。
+
+### 表2 排序对比（被 layerwise buffer bug 阻碍，作为局限）
+
+尝试 N=50 phase + `--no-drain-on-update` + bg-budget=1 重跑三排序（新增 `--no-drain-on-update` 标志让 update 后不立即 drain、首 post 前一次性按 budget drain，制造多文档排队让排序有区分度）。结果 fifo/hot **均同样崩溃在 `ValueError: Layer 0 is not loaded`**（gpu_connector.py:356）。
+
+**根因**：`refresh_article` 删 stale 后破坏 layerwise `buffer_mapping`（滑动窗口），**必须立即用 generate 修复**（proactive 表1 能跑通就是 update 后立即 drain 用后台 generate 修复了 buffer）。要让排序有意义需 update 后不立即 drain（让积压累积），但不立即 drain 就触发 buffer bug。与 passive 是**同一 bug**。
+
+调用链：`gpu_model_runner.maybe_setup_kv_connector → start_load_kv → blender.blend → process_qkv → gpu_connector.get_kv(layer_id) → 崩溃`。
+
+**处理**：作为论文已知局限（§7），排序对比 + passive 留作并发场景未来工作（§4.4 并发预案）。贡献二的支撑改为：形式化（§3.4.1）+ motivation 空闲窗口演示 + bg_tokens 后台成本数据 + F1 质量保证。
+
+### granularity 消融（question vs paragraph，N=50 proactive）
+
+| 粒度 | avg_doc_chunks | bg_tokens | bg_chunks | bg_s | post/0 | miss@post0 | flip |
+|---|---|---|---|---|---|---|---|
+| question（短文档） | 6.4 | 121564 | 521 | 21.0 | 0.104s | **0**（全命中） | 0.16 |
+| paragraph（长文档） | 10.9 | 6870 | 52 | 1.8 | 0.109s | 1407.6 | 0.15 |
+
+**观察**：
+- question（短文档，平均 6.4 chunk）proactive 全命中（miss=0），bg_tokens 与 N=200 表1 按比例一致（121564/50 ≈ 490140/200）
+- paragraph（长文档，平均 10.9 chunk）数据反常：bg_tokens 反而**更少**（6870 vs 121564）且**未全命中**（miss=1407）。因 paragraph 模式编辑落在 supporting fact 所在段（build_paragraph_granularity 不接 edit_mode，编辑机制与 question 不同），级联行为与文档结构交互方式不同
+- 诚实报告：长文档的增量收益机制受编辑模式与文档结构交互影响，question 模式下 proactive 增量收益明确，paragraph 模式需进一步研究编辑机制对级联的调制
+
+---
+
 ## 论文回填指引
 
 | 论文位置 | 填什么 | 数据 |

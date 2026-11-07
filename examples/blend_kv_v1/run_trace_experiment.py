@@ -64,6 +64,11 @@ def parse_args():
              "oracle=离线知晓轨迹的上界",
     )
     parser.add_argument(
+        "--no-drain-on-update", action="store_true",
+        help="phase 模式专用：update 事件后不立即刷新（让积压累积），"
+             "改为在首个 post 请求前一次性按 budget 刷新——让排序策略有区分度",
+    )
+    parser.add_argument(
         "--summarize", default=None,
         help="汇总模式：给出结果目录，打印所有 results_*.json 的对比表",
     )
@@ -100,7 +105,7 @@ def build_prompt(tokenizer, sys_prompt, urls, current_docs, question):
     return ids
 
 
-def run_policy(policy, trace, llm, tokenizer, bg_budget, order="hot"):
+def run_policy(policy, trace, llm, tokenizer, bg_budget, order="hot", drain_on_update=True):
     """回放整条事件流，返回结果 dict。"""
     sys_prompt = trace["sys_prompt"]
     current_docs = dict(trace["docs"])
@@ -137,6 +142,7 @@ def run_policy(policy, trace, llm, tokenizer, bg_budget, order="hot"):
             bg["wall_s"] += job.wall_time
 
     seq_in_phase = {}
+    prev_phase = None
     for ev in trace["events"]:
         if ev["type"] == "request":
             prompt = build_prompt(
@@ -157,6 +163,10 @@ def run_policy(policy, trace, llm, tokenizer, bg_budget, order="hot"):
             seq = seq_in_phase.get((ev["qid"], ev["phase"]), 0)
             seq_in_phase[(ev["qid"], ev["phase"])] = seq + 1
 
+            # phase 模式：首个 post 请求前一次性 drain（让 budget 限制下排序区分度体现）
+            if not drain_on_update and ev["phase"] == "post" and prev_phase != "post":
+                drain_background()
+
             sp = SamplingParams(temperature=0, max_tokens=1)
             t0 = time.time()
             llm.generate(prompt_token_ids=prompt, sampling_params=sp)
@@ -169,7 +179,7 @@ def run_policy(policy, trace, llm, tokenizer, bg_budget, order="hot"):
                 "doc_miss_tokens": miss_tokens, "prefill_s": round(prefill_s, 4),
             }
 
-            if ev["gen_answer"]:
+            if ev["gen_answer"] or ev["phase"] == "pre":
                 sp_ans = SamplingParams(temperature=0, max_tokens=64)
                 t0 = time.time()
                 outs = llm.generate(prompt_token_ids=prompt, sampling_params=sp_ans)
@@ -185,6 +195,7 @@ def run_policy(policy, trace, llm, tokenizer, bg_budget, order="hot"):
                     )
             rows.append(row)
             drain_background()
+            prev_phase = ev["phase"]
 
         elif ev["type"] == "update":
             url, new_text = ev["url"], ev["new_text"]
@@ -204,7 +215,9 @@ def run_policy(policy, trace, llm, tokenizer, bg_budget, order="hot"):
                 bg["tokens"] += len(doc_ids)
                 bg["chunks"] += 1
                 bg["wall_s"] += time.time() - t0
-            drain_background()
+            if drain_on_update:
+                drain_background()
+            prev_phase = "update"
 
     # ---------------- 汇总 ----------------
     def group_mean(phase, seq, field):
@@ -281,7 +294,8 @@ def main():
 
     with build_llm_with_lmcache("LMCacheConnectorV1", args.model) as llm:
         result = run_policy(
-            args.policy, trace, llm, tokenizer, args.bg_budget, args.order
+            args.policy, trace, llm, tokenizer, args.bg_budget, args.order,
+            drain_on_update=not args.no_drain_on_update,
         )
 
     os.makedirs(args.out_dir, exist_ok=True)

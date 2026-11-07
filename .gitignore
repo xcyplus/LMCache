@@ -124,4 +124,4 @@ lmcache/experimental/tests
 .workbuddy/
 
 # experiment results archive (内容已解压为 json, 冗余打包)
-paper/results/results.tar.gz
+paper/results/results*.tar.gz
