@@ -1,0 +1,16 @@
+{
+  "warmup_time_s": 0.41126489639282227,
+  "doc_tokens": 661,
+  "arms": {
+    "passive": {
+      "arm": "passive",
+      "fresh_chunks": 6,
+      "stale_chunks": 6,
+      "bg_time_s": 0.0022373199462890625,
+      "ttft_probe_s": 0.132,
+      "answer_time_s": 0.399,
+      "answer": "The current population of Beijing is 22,108,000 people.",
+      "flip_ok": false
+    }
+  }
+}

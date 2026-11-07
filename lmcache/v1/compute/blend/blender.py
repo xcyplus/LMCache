@@ -58,6 +58,21 @@ class LMCBlender:
         attn_metadata,
     ):
         logger.debug(f"Blender is processing KV for layer {layer_id}")
+
+        # If this layer is not in buffer_mapping (e.g., cache miss / empty
+        # retrieve keys), skip blending and use vllm's freshly computed KV.
+        # This happens when refresh_article removed stale chunks but no
+        # cached chunks match the new document content.
+        if layer_id not in self.gpu_connector.buffer_mapping:
+            logger.debug(
+                f"Layer {layer_id} not in buffer_mapping, skipping blend"
+            )
+            if attn_output is None:
+                attn_output = torch.empty(
+                    q.shape, dtype=q.dtype, device=q.device,
+                )
+            return q, k, v, residual, attn_output, attn_metadata
+
         old_k, old_v = self.gpu_connector.get_kv(layer_id)
 
         if attn_output is None:

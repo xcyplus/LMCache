@@ -603,7 +603,8 @@ class LMCacheEngine:
         yield None
 
         # synchronize the last layer
-        next(mem_obj_consumer)
+        if keys:
+            next(mem_obj_consumer)
 
         retrieved_tokens = torch.sum(ret_mask)
         self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)

@@ -203,7 +203,11 @@ def run_policy(policy, trace, llm, tokenizer, bg_budget, order="hot", drain_on_u
             if policy == "norefresh":
                 pass
             elif policy == "passive":
-                engine.refresh_article(url, new_text)
+                # 只更新元数据（_url_variants），不删 storage 的 stale chunk。
+                # stale 旧 KV 仍在，post/0 blend 命中没变部分（旧 KV），
+                # blend_recompute_ratio 在线重算编辑差异；编辑部分 miss 由 vllm 算。
+                # 隔离的是"后台预计算"的价值（proactive vs passive）。
+                engine.token_database.refresh_article(url, new_text)
             elif policy == "proactive":
                 manager.submit_update(url, new_text)
             elif policy == "proactive_full":
