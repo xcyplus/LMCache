@@ -119,3 +119,9 @@ lmcache/experimental/tests
 
 # Ignore all log files
 *.log
+
+# WorkBuddy workspace (工具工作目录, 不入库)
+.workbuddy/
+
+# experiment results archive (内容已解压为 json, 冗余打包)
+paper/results/results.tar.gz

@@ -1,0 +1,18 @@
+{
+  "warmup_time_s": 0.5425918102264404,
+  "doc_tokens": 661,
+  "arms": {
+    "proactive": {
+      "arm": "proactive",
+      "fresh_chunks": 6,
+      "stale_chunks": 6,
+      "bg_tokens": 1373,
+      "bg_chunks": 6,
+      "bg_time_s": 0.245286226272583,
+      "ttft_probe_s": 0.085,
+      "answer_time_s": 0.882,
+      "answer": "根据2025年10月最新统计，北京市常住人口已增长至2210.8万人。",
+      "flip_ok": true
+    }
+  }
+}
