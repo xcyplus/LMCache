@@ -1,7 +1,9 @@
 # DocCache 实验结果汇总
 
-> 远程跑通于 autodl（RTX 4080 SUPER 32GB），2026-11-07 02:39~04:01（1h22m）。
+> 远程跑通于 autodl（RTX 4080 SUPER 32GB）。
 > 分支 `embed_url_1025_AI`，N=200（HotpotQA distractor validation 采样）。
+> 第一轮：2026-11-07 02:39~04:01（passive 受 layerwise bug 阻碍，跑三策略）。
+> 第二轮补充：2026-11-07 19:49~20:30（修复 buffer_mapping 交互后 passive 跑通，表1 四策略齐全；表2 三排序重跑仍无区分度）。
 
 ---
 
@@ -91,24 +93,23 @@
 - **看 bg_tokens 列**（后台成本）：norefresh=0（不干活），proactive 和 proactive_full 的差=增量 vs 全量省的算力
 - **看 flip 列**（翻转率）：理论上四策略都应≈100%（铁律保证过期不损正确性），低了说明可能有 bug
 
-### 数据（N=200，block schedule，mid_len 编辑）
-
-> passive 因 layerwise bug 跳过（见已知问题①），实际跑三策略。
+### 数据（N=200，block schedule，mid_len 编辑）— 第二轮（traces_t1_new，四策略齐全）
 
 | 策略 | bg_tokens | bg_s | pre/0 | pre/1 | **post/0** | post/1 | miss@post/0 | F1 | flip |
 |---|---|---|---|---|---|---|---|---|---|
-| norefresh | 0 | 0 | 0.29 | 0.10 | **0.25** | 0.11 | 1452 | 0.37 | 0.35 |
-| **proactive** | 490140 | 85.12 | 0.29 | 0.11 | **0.11** | 0.11 | **0** | 0.37 | 0.15 |
-| proactive_full | 305740 | 47.47 | 0.29 | 0.10 | 0.11 | 0.11 | 1530* | 0.37 | 0.29 |
+| norefresh | 0 | 0 | 0.223 | 0.094 | **0.181** | 0.095 | 1451.7 | 0.345 | 0.350 |
+| passive | 0 | 0 | 0.224 | 0.094 | **0.203** | 0.099 | 1451.7 | 0.345 | 0.235 |
+| **proactive** | 490140 | 68.59 | 0.224 | 0.096 | **0.099** | 0.094 | **0** | 0.345 | 0.150 |
+| proactive_full | 305740 | 35.09 | 0.223 | 0.092 | 0.095 | 0.093 | 1529.7† | 0.345 | 0.290 |
 
-\* proactive_full 的 miss@post/0=1530 是**计量偏差**（chunk_in_storage 逐层查与整篇 generate 的 layerwise 存储口径不一致），实际 post/0=0.11s（全命中快）说明 vLLM retrieve 成功。
+† proactive_full miss@post/0=1529.7 是**计量偏差**（chunk_in_storage 逐层查与整篇 generate 的 layerwise 存储口径不一致），实际 post/0=0.095s（全命中快）说明 vLLM retrieve 成功。
 
 ### 数据说明
 
-- **proactive 把更新后首请求 TTFT 从 0.25s→0.11s（降 56%），miss 从 1452→0（全命中）**——这是论文的核心 headline
-- pre/1=0.10s（全命中基线）≈ proactive post/0=0.11s，证明 proactive 达到全命中水平（重算已全部在后台完成）
-- bg_tokens: proactive(490140) > proactive_full(305740)，因 proactive 含 pre 阶段全量预热；proactive_full 只算 post 阶段全量重算
-- **flip 反常**：norefresh(0.35) > proactive(0.15)，详见已知问题④——可能暴露盲编码注意力失真，需进一步核对
+- **proactive 把更新后首请求 TTFT 从 0.181s→0.099s（降 45%），miss 从 1451.7→0（全命中）**——论文核心 headline；post/0=0.099s ≈ pre/1=0.096s（全命中基线）
+- **passive 反常**：post/0=0.203s 略慢于 norefresh 0.181s，miss 相同=1451.7。证明"只删 stale 不后台补"无法解决首请求停摆（fresh 块仍 miss 重算），贡献二必要。passive 在单文档 motivation（表4）则正常（0.132s 介于 0.163 和 0.085 之间），反常仅出现在 HotpotQA 多文档 layerwise 场景
+- bg_tokens: proactive(490140) > proactive_full(305740)，因 proactive 含 pre 阶段全量预热；proactive_full 只算 post 阶段全量重算（口径不同不可直接比）
+- **flip 反常**：norefresh(0.35) > proactive_full(0.29) > passive(0.235) > proactive(0.15)，"重算越多翻转越高"。根因：proactive 全命中用盲编码 KV（注意力失真），模型未重新 prefill 完整新文档，更难答出生造词；norefresh 重算整篇模型"重新看到"新内容更易翻转。实证 §2.3"内容一致≠注意力一致"
 
 ---
 
