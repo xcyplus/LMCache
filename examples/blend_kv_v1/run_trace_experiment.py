@@ -213,11 +213,16 @@ def run_policy(policy, trace, llm, tokenizer, bg_budget, order="hot", drain_on_u
             elif policy == "proactive_full":
                 engine.remove_article(url)
                 engine.refresh_article(url, new_text)
-                doc_ids = tokenizer.encode(new_text)[1:]
+                # 逐块盲编码（与 proactive 执行器一致），保证存储登记口径与
+                # 请求前计量（chunk_in_storage 查 compute_refresh_chunks 的 hash）一致，
+                # 避免 miss_tokens 计量偏差。
                 t0 = time.time()
-                encode_fn(doc_ids)
-                bg["tokens"] += len(doc_ids)
-                bg["chunks"] += 1
+                for chunk_tokens, h in engine.token_database.compute_refresh_chunks(
+                    new_text, include_bos_variant=False
+                ):
+                    encode_fn(chunk_tokens)
+                    bg["tokens"] += len(chunk_tokens)
+                    bg["chunks"] += 1
                 bg["wall_s"] += time.time() - t0
             if drain_on_update:
                 drain_background()
