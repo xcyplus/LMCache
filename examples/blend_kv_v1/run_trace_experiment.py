@@ -169,21 +169,39 @@ def run_policy(policy, trace, llm, tokenizer, bg_budget, order="hot", drain_on_u
             # phase 模式：首个 post 请求前一次性 drain budget 篇文档。
             # 三排序在有限 budget 下决定先刷哪些文档→被刷的 post/0 命中、
             # 没刷的 miss→产生可测区分度（表 2 最小可行并发验证）。
+            # 用整篇 generate（非逐块）——诊断实验证实逐块 generate 的 KV
+            # 不被请求路径 vLLM retrieve 认（两口径独立），整篇 generate 的 KV 被认。
             if not drain_on_update and ev["phase"] == "post" and prev_phase != "post":
                 target = bg_budget
+                with manager._lock:
+                    if not manager._pending:
+                        candidates = []
+                    elif manager.order_policy == "fifo":
+                        candidates = sorted(manager._pending.values(),
+                            key=lambda j: j.enqueued_at)[:target]
+                    elif manager.order_policy == "oracle":
+                        candidates = sorted(manager._pending.values(),
+                            key=lambda j: manager._oracle_ranking.get(
+                                j.url, float("inf")))[:target]
+                    else:  # hot
+                        candidates = sorted(manager._pending.values(),
+                            key=lambda j: (-j.hotness, j.enqueued_at))[:target]
                 refreshed = 0
-                while refreshed < target:
-                    jobs = manager.refresh_pending(force=True)
-                    if not jobs:
-                        break
-                    for job in jobs:
-                        bg["tokens"] += job.recomputed_tokens
-                        bg["chunks"] += job.n_chunks
-                        bg["wall_s"] += job.wall_time
-                    refreshed += len(jobs)
+                for job in candidates:
+                    doc_ids = tokenizer.encode(job.new_text)[1:]
+                    t0_bg = time.time()
+                    encode_fn(doc_ids)
+                    bg["tokens"] += len(doc_ids)
+                    bg["chunks"] += 1
+                    bg["wall_s"] += time.time() - t0_bg
+                    refreshed += 1
+                    with manager._lock:
+                        manager._pending.pop(job.url, None)
+                        manager.completed.append(job)
                 logger.info(
-                    "Post-phase drain: refreshed %d/%d docs, pending=%d",
-                    refreshed, target, manager.pending_count(),
+                    "Post-phase drain (full-doc): refreshed %d/%d docs, "
+                    "pending=%d, order=%s",
+                    refreshed, target, manager.pending_count(), order,
                 )
 
             sp = SamplingParams(temperature=0, max_tokens=1)
