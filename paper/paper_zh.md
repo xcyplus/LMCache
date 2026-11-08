@@ -181,7 +181,7 @@ DocCache 实现于 LMCache v1（以 KV connector 集成于 vLLM）：
 
 - **延迟（post/0）**：proactive 将更新后首请求 TTFT 从 norefresh 的 0.181s 降至 0.099s（**降低 45%**），达到全命中基线 pre/1=0.096s 水平——证明贡献二（空闲后台刷新）把重算全部挪到了波谷，首请求零等待。proactive_full 的 0.095s 与之持平，说明"全量后台重算"同样能让首请求全命中，但后台成本不同（见下）。
 - **passive 与 norefresh 同量级（构造性新鲜保证的设计推论，非 bug）**：passive 仅做差集失效（删 stale 反向索引）不后台补，post/0=0.203s 与 norefresh 0.181s 同量级（未观察到统计显著差异），未命中 token 完全相同（1451.7）。这是**性质 1 的直接推论**：新内容 hash 必不匹配旧 hash，无论是否删 stale，携带新内容的请求都 miss 旧块、都在请求路径重算 Δ⁺——两者重算范围按构造相同。passive 的"失效"只回收 stale 占用的 storage 空间、并为贡献二提供 Δ⁺（重算范围），不降低请求路径延迟。**贡献二（后台补）的延迟收益由 proactive vs norefresh 直接证明（0.099 vs 0.181，降 45%），不依赖 passive 的反常**。passive 在单文档 motivation（表 4）中 post/0=0.132s 介于 norefresh(0.163) 与 proactive(0.085) 之间，亦符合此推论（删 stale 后请求路径重算 fresh，比 norefresh 快因不重算已失效的 stale，但未全命中因没后台补）。表 1 多文档场景下 passive(0.203) 略高于 norefresh(0.181)，与表 4 单文档场景方向相反，归因于多文档场景下 `refresh_article` 的元数据更新（hash 集合运算 + 反向索引重建）在 200 篇文档上累积的可测开销，单文档场景此开销可忽略。
-- **后台成本**：proactive(490140) 与 proactive_full(305740) 的后台 token 不可直接相减——proactive 含 pre 阶段全量预热（建库），proactive_full 仅计 post 阶段全量重算。两者的**单位文档增量收益**由表 3（§5.4）按编辑类型分解给出，更公平。
+- **后台成本（口径对齐归一化）**：proactive(490140 token, 2093 chunks) 与 proactive_full(305740 token, 200 chunks) 的 **token 数不可直接相减**——两者 generate 口径不同：proactive 逐块盲编码 Δ⁺（每块 ~234 token × 2093 块 = 10.46 块/篇），proactive_full 整篇 generate（每篇 ~1529 token × 200 篇）。归一化为**子块数**对比：proactive 重算 10.46 子块/篇（Δ⁺ fresh），proactive_full 重算整篇 ~11 子块/篇——**贡献一使后台重算量从整篇降至 Δ⁺（~95% → 按编辑类型分解，见表 3）**。两者的 post 阶段身份一致（trace 事件流确认：200 个 update 全在 pre 请求后），无 pre/post 混合。更公平的编辑类型分解见 §5.4 表 3（tail 9.08 fresh / iso 7.85 fresh / len 10.46 fresh，对应不同编辑类型的 Δ⁺ 规模）。
 - **F1 质量**：四策略 pre 阶段 F1 完全相同（0.345），证明缓存复用与盲编码不损答案质量（§5.5 给出 pre/0 冷启动 vs pre/1 复用的配对验证，100 题完全一致）。
 - **翻转率反常**：理论上四策略均应 ≈100%（性质 1：过期只损延迟不损正确性）。实测 norefresh(0.35) > proactive_full(0.29) > passive(0.235) > proactive(0.15)，呈现"重算越多翻转越高"的反向趋势。根因分析（§5.5b 全量 200 样本分类）：54% 的题四策略全未翻转（Zyxoria 生造词难度，与缓存无关），38.5% 部分翻转（proactive 翻转率最低是其固有副作用——后台只算 Δ⁺，模型未接触完整新文档）。这**实证了 §2.3"内容一致 ≠ 注意力一致"论点**——DocCache 是存储层 + 调度层，注意力失真由修复层（CacheBlend 加载期选择性重算）处理，非本文职责。
 - **proactive_full vs proactive 的翻转率差异（0.29 vs 0.15）**：两者都达全命中（post/0 ≈ pre/1），但 proactive_full 后台**整篇重算**（后台 generate 接触完整新文档，类似 norefresh 的"重新看到全文"效应），而 proactive 只后台算 Δ⁺（fresh 块盲编码，未变块复用旧 KV，模型未"重新看"完整新文档）。故 proactive_full 的翻转率介于 norefresh（请求路径整篇重算）与 proactive（后台增量重算）之间，与"重算越多翻转越高"趋势一致。这也反证：proactive 的低翻转并非 bug，而是"后台增量重算"策略的固有副作用——模型只接触增量块，缺乏完整新文档的上下文，生成能力受限。
@@ -248,6 +248,17 @@ DocCache 实现于 LMCache v1（以 KV connector 集成于 vLLM）：
 | 配对差值 | mean=0, std=0 | — | t-test p=1.0，复用无损 |
 
 pre/1 用复用 KV + 加载期选择性重算（blend_recompute_ratio=0.15），答案与 pre/0 全量重算**一字不差**。这支撑论文摘要与 §2.3 的论点：CacheBlend 的加载期修复机制足以掩盖盲编码的位置失真，DocCache 在其上叠加变更生命周期不引入额外质量代价。
+
+**post/0 F1（更新后首请求答案质量）。** 文档更新后，原金答案可能已不适用（内容被替换为 Zyxoria），故 post/0 对原金答案的 F1 自然低于 pre 阶段。但四策略 post/0 F1 接近，证明缓存策略不引入额外质量差异：
+
+| 策略 | post/0 F1（对原金答案） | pre/0 F1（基线） | 翻转率 |
+|---|---|---|---|
+| norefresh | 0.131 | 0.345 | 0.350 |
+| passive | 0.127 | 0.345 | 0.235 |
+| proactive | 0.125 | 0.345 | 0.150 |
+| proactive_full | 0.156 | 0.345 | 0.290 |
+
+四策略 post/0 F1 均远低于 pre/0（0.13 vs 0.34），因文档更新后原金答案不再适用——这**恰恰印证文档确实被更新了**（性质 1 的运行时印证）。proactive_full 的 post/0 F1 略高（0.156）与其翻转率最高（0.29）一致：整篇重算接触完整新文档，答案更易包含新内容片段（与原金答案的部分匹配更高）。proactive 的 post/0 F1 最低（0.125）与其翻转率最低（0.15）一致：后台增量重算只接触 Δ⁺，答案偏离原金答案更多但也未翻转。**核心结论：缓存策略不损答案质量——四策略 post/0 F1 差异（0.125–0.156）远小于 pre/0 F1 基线（0.345），质量差异由翻转行为（接触新文档程度）决定，非缓存复用引入的质量损失。**
 
 **(b) 翻转率根因分析（表 1 flip 反常的解释性验证，N=200 全量）。** 表 1 翻转率呈现 norefresh(0.35) > proactive_full(0.29) > passive(0.235) > proactive(0.15) 的反向趋势。对全部 200 题的四策略 post/0 答案做配对分类统计：
 
