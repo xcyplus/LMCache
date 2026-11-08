@@ -26,9 +26,12 @@
 import argparse
 import glob
 import json
+import logging
 import os
 import sys
 import time
+
+logger = logging.getLogger(__name__)
 
 # First Party
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -163,9 +166,25 @@ def run_policy(policy, trace, llm, tokenizer, bg_budget, order="hot", drain_on_u
             seq = seq_in_phase.get((ev["qid"], ev["phase"]), 0)
             seq_in_phase[(ev["qid"], ev["phase"])] = seq + 1
 
-            # phase 模式：首个 post 请求前一次性 drain（让 budget 限制下排序区分度体现）
+            # phase 模式：首个 post 请求前一次性 drain budget 篇文档。
+            # 三排序在有限 budget 下决定先刷哪些文档→被刷的 post/0 命中、
+            # 没刷的 miss→产生可测区分度（表 2 最小可行并发验证）。
             if not drain_on_update and ev["phase"] == "post" and prev_phase != "post":
-                drain_background()
+                target = bg_budget
+                refreshed = 0
+                while refreshed < target:
+                    jobs = manager.refresh_pending(force=True)
+                    if not jobs:
+                        break
+                    for job in jobs:
+                        bg["tokens"] += job.recomputed_tokens
+                        bg["chunks"] += job.n_chunks
+                        bg["wall_s"] += job.wall_time
+                    refreshed += len(jobs)
+                logger.info(
+                    "Post-phase drain: refreshed %d/%d docs, pending=%d",
+                    refreshed, target, manager.pending_count(),
+                )
 
             sp = SamplingParams(temperature=0, max_tokens=1)
             t0 = time.time()
@@ -194,7 +213,11 @@ def run_policy(policy, trace, llm, tokenizer, bg_budget, order="hot", drain_on_u
                         answer, ev.get("fake_entity", FAKE_ENTITY)
                     )
             rows.append(row)
-            drain_background()
+            # --no-drain-on-update 模式下 post 阶段内不再 drain：
+            # budget 已在阶段开始时一次性消耗（只刷 budget 篇文档），
+            # 三排序决定哪些文档被刷→被刷的 post/0 命中、没刷的 miss。
+            if drain_on_update or ev["phase"] != "post":
+                drain_background()
             prev_phase = ev["phase"]
 
         elif ev["type"] == "update":
@@ -251,6 +274,13 @@ def run_policy(policy, trace, llm, tokenizer, bg_budget, order="hot", drain_on_u
             "hit_ratio_pre_1": group_mean("pre", 1, "doc_hit_chunks"),
             "pre_f1": round(sum(pre_f1) / len(pre_f1), 4) if pre_f1 else None,
             "post_flip_rate": round(sum(post_flip) / len(post_flip), 4) if post_flip else None,
+            # post/0 全命中率：被后台刷新到的文档比例（三排序区分度的核心指标）
+            "post_0_full_hit_rate": round(
+                sum(1 for r in rows if r["phase"] == "post" and r["seq"] == 0
+                    and r["doc_total_chunks"] > 0
+                    and r["doc_hit_chunks"] == r["doc_total_chunks"])
+                / max(1, sum(1 for r in rows if r["phase"] == "post" and r["seq"] == 0)), 4
+            ),
         },
         "requests": rows,
     }
@@ -260,20 +290,21 @@ def summarize(out_dir):
     """读取目录下所有 results_*.json，打印跨策略对比表。"""
     files = sorted(glob.glob(os.path.join(out_dir, "results_*.json")))
     assert files, f"no results_*.json under {out_dir}"
-    print(f"{'policy/order':<24}{'bg_tokens':>10}{'bg_s':>8}{'pre/0':>8}{'pre/1':>8}"
-          f"{'post/0':>8}{'post/1':>8}{'miss@post/0':>13}{'F1':>8}{'flip':>7}")
-    print("-" * 104)
+    print(f"{'policy/order':<24}{'bg_tok':>10}{'bg_s':>7}{'pre/0':>7}{'pre/1':>7}"
+          f"{'post/0':>7}{'miss@0':>9}{'hit%':>6}{'F1':>6}{'flip':>6}")
+    print("-" * 96)
     for fp in files:
         with open(fp, "r", encoding="utf-8") as f:
             r = json.load(f)
         s = r["summary"]
         name = f"{r['policy']}/{r.get('order_policy', 'hot')}"
+        hit_rate = s.get("post_0_full_hit_rate", 0)
         print(
-            f"{name:<24}{r['bg']['tokens']:>10}{r['bg']['wall_s']:>8.2f}"
-            f"{fmt(s['prefill_pre_0_s']):>8}{fmt(s['prefill_pre_1_s']):>8}"
-            f"{fmt(s['prefill_post_0_s']):>8}{fmt(s['prefill_post_1_s']):>8}"
-            f"{fmt(s['miss_tokens_post_0']):>13}{fmt(s['pre_f1']):>8}"
-            f"{fmt(s['post_flip_rate']):>7}"
+            f"{name:<24}{r['bg']['tokens']:>10}{r['bg']['wall_s']:>7.2f}"
+            f"{fmt(s['prefill_pre_0_s']):>7}{fmt(s['prefill_pre_1_s']):>7}"
+            f"{fmt(s['prefill_post_0_s']):>7}"
+            f"{fmt(s['miss_tokens_post_0']):>9}{hit_rate*100:>5.0f}%"
+            f"{fmt(s['pre_f1']):>6}{fmt(s['post_flip_rate']):>6}"
         )
     print("-" * 96)
     print("解读: post/0 列 = 更新后首请求延迟（proactive 应最快，norefresh 最慢）")
