@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+import os
 from typing import Optional
 
 # Third Party
@@ -33,12 +34,15 @@ class LMCBlender:
         # TODO: remove this hardcode
         self.num_layers = len(vllm_model.model.layers)
 
-        # TODO (Jiayi): make this less hard-coded
+        # Blend recompute ratio: read from env (LMCACHE_BLEND_RECOMPUTE_RATIO)
+        # to support ablation (15% vs 20% etc.). Defaults to 0.15 (CacheBlend).
+        _blend_ratio = float(os.environ.get("LMCACHE_BLEND_RECOMPUTE_RATIO", "0.15"))
         self.common_metadata = LMCBlendCommonMetadata(
             check_layers=[1],
-            recomp_ratios=[0.15],
+            recomp_ratios=[_blend_ratio],
             thresholds=None,
         )
+        logger.info(f"LMCBlender initialized with blend_recompute_ratio={_blend_ratio}")
 
         # This will be set during the blending process
         self.metadata = LMCBlendMetadata(
