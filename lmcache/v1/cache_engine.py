@@ -720,13 +720,12 @@ class LMCacheEngine:
     # 文章级元数据管理（仅当 token_database 为 UrlSegmentTokenDatabase 时生效）
     # ------------------------------------------------------------------
 
-    def _release_article_refs(self, request_ids: List[str]) -> None:
-        """按 process_tokens 记录的引用次数成对扣减文章引用计数。"""
+    def _clear_request_inputs(self, request_ids: List[str]) -> None:
+        """清理请求的引导匹配输入（request_id -> url 列表），避免累积泄漏。"""
         if not isinstance(self.token_database, UrlSegmentTokenDatabase):
             return
         for request_id in request_ids:
-            for url, count in self.token_database.clear_request(request_id).items():
-                self.token_database.dec_ref(url, count)
+            self.token_database.clear_request(request_id)
 
     def _remove_chunk(self, chunk_hash: int) -> None:
         """驱逐一个 chunk 的 KV cache（layerwise 模式下需按层拆分 key）。"""
@@ -836,8 +835,8 @@ class LMCacheEngine:
             )
             return num_tokens
         finally:
-            # 该 event 不会再走到 lookup_unpin，这里显式释放文章引用
-            self._release_article_refs([event_id])
+            # 该 event 不会再走到 lookup_unpin，这里显式清理请求输入
+            self._clear_request_inputs([event_id])
 
     # TODO(Jiayi): Need to handle the case where `tokens=None`.
     # In this case, we compress all tokens.
@@ -896,8 +895,8 @@ class LMCacheEngine:
 
             return num_tokens
         finally:
-            # 该 event 不会再走到 lookup_unpin，这里显式释放文章引用
-            self._release_article_refs([event_id])
+            # 该 event 不会再走到 lookup_unpin，这里显式清理请求输入
+            self._clear_request_inputs([event_id])
 
     @_lmcache_nvtx_annotate
     def lookup_unpin(self, request_ids: list[str]) -> None:
@@ -905,8 +904,8 @@ class LMCacheEngine:
             if request_id in self.lookup_pins:
                 self.storage_manager.batched_unpin(self.lookup_pins[request_id])
                 del self.lookup_pins[request_id]
-        # 请求结束，对该请求引用的所有文章做引用计数 -1（按次数成对扣减）
-        self._release_article_refs(request_ids)
+        # 请求结束，清理该请求的引导匹配输入
+        self._clear_request_inputs(request_ids)
 
     @_lmcache_nvtx_annotate
     def clear(

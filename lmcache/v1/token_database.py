@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from collections import defaultdict
-from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple, Union
 import abc
 import json
@@ -18,6 +16,11 @@ from lmcache.config import LMCacheEngineMetadata
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
 from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.doc_index import (
+    ArticleCacheMetadata,
+    ArticleRegistry,
+    UrlSegmentIndex,
+)
 
 logger = init_logger(__name__)
 
@@ -373,25 +376,6 @@ class SegmentTokenDatabase(TokenDatabase):
             start_idx = end_idx
 
 
-@dataclass
-class ArticleCacheMetadata:
-    """一篇文章在 LMCache 中的元数据。
-
-    仅保存在进程内存中，与 CPU 内存 KV cache（LocalCPUBackend）同生命周期：
-    进程重启后两者一起丢失，保持一致。如果 KV cache 落盘，才需要额外持久化
-    本结构。
-    """
-    # 文章唯一标识
-    url: str
-    # 该文章所有 chunk 的 hash（按 chunk_size 切块后的内容 hash 列表）
-    chunk_hashes: List[int]
-    # 创建 / 最后一次刷新的时间戳（秒）
-    created_at: int
-    # 当前引用计数：有多少请求正在使用这篇文章的 KV cache。
-    # 驱逐时跳过 ref_cnt > 0 的文章。
-    ref_cnt: int = 0
-
-
 class UrlSegmentTokenDatabase(TokenDatabase):
     """用 RAG 元数据 (url -> 文本) 定位 token 区间，不再依赖分隔符。
 
@@ -406,10 +390,9 @@ class UrlSegmentTokenDatabase(TokenDatabase):
     3. 每个子块的 key 只由该子块内容 hash 得到（与位置、前缀无关），因此
        同样的文档在 prompt 中换顺序后仍然能命中；文档内容更新时只有变化
        的子块失效，其余复用。
-    4. 维护文章级元数据 `self.articles`（url -> ArticleCacheMetadata）和
-       反向索引 `self.hash_to_url`，仅存内存，与 CPU 内存 KV cache 同
-       生命周期。支持 `refresh_article` 增量刷新、`remove_article` 驱逐、
-       `inc_ref/dec_ref` 引用计数。
+    4. 匹配索引与文章账本（`UrlSegmentIndex` 与 `ArticleRegistry`）拆到
+       `lmcache.v1.doc_index`，仅存内存，与 CPU 内存 KV cache 同生命周期。
+       支持 `refresh_article` 增量刷新、`remove_article` 驱逐。
     """
 
     def __init__(
@@ -425,14 +408,10 @@ class UrlSegmentTokenDatabase(TokenDatabase):
         assert metadata is not None, "metadata is required for UrlSegmentTokenDatabase"
         self.tokenizer = AutoTokenizer.from_pretrained(metadata.model_name)
 
-        # (url, token_ids) 列表，按 token 数从长到短排序，保证最长匹配优先
-        self.url_entries: List[Tuple[str, List[int]]] = []
-        # chunk hash -> url，记录每段 cache 的来源文本
-        self.hash_to_url: dict[int, str] = {}
-        # url -> 文章元数据，仅内存，与 CPU 内存 KV cache 同生命周期
-        self.articles: dict[str, ArticleCacheMetadata] = {}
-        # request_id -> {url: 引用次数}（用于 inc_ref/dec_ref 成对计数）
-        self._request_urls: dict[str, dict[str, int]] = {}
+        # ① 匹配索引 + ② 账本：拆到 lmcache.v1.doc_index，各自持有自己的锁
+        self.index = UrlSegmentIndex()
+        self.registry = ArticleRegistry()
+
         # request_id -> 上层传入的有序 url 列表（引导匹配，避免全库扫描）
         self._request_input_urls: dict[str, List[str]] = {}
         # url -> 累计命中次数（process_tokens 每次匹配到该 url 时 +1），
@@ -440,15 +419,7 @@ class UrlSegmentTokenDatabase(TokenDatabase):
         self.url_access_counts: dict[str, int] = {}
         # url -> 最近一次命中时间戳（热度 tie-break / 新鲜度参考）
         self.url_last_access: dict[str, float] = {}
-        # url -> 该 url 的 token 变体列表（带 BOS / 去 BOS），用于引导匹配
-        self._url_variants: dict[str, List[List[int]]] = {}
-        # 按首 token建索引：匹配时只查首 token 相同的条目。
-        # 必须在读取 rag_db 之前初始化，否则文件缺失时 _full_scan_match 会
-        # 访问不存在的属性。
-        self._first_token_index: dict[int, List[Tuple[str, List[int]]]] = defaultdict(
-            list
-        )
-        # 保护 articles / hash_to_url / _request_urls 的并发写
+        # 保护 _request_input_urls / 热度计数的并发写
         self._lock = threading.Lock()
 
         db_path = config.rag_db_path if config is not None else None
@@ -463,6 +434,7 @@ class UrlSegmentTokenDatabase(TokenDatabase):
         with open(db_path, "r", encoding="utf-8") as f:
             url_to_text = json.load(f)
 
+        variants_map: dict[str, List[List[int]]] = {}
         for url, text in url_to_text.items():
             if not text:
                 continue
@@ -471,113 +443,14 @@ class UrlSegmentTokenDatabase(TokenDatabase):
             variants: List[List[int]] = [list(token_ids)]
             if len(token_ids) > 1:
                 variants.append(list(token_ids[1:]))
-            self._url_variants[url] = variants
-        self._rebuild_url_index()
+            variants_map[url] = variants
+        self.index.load(variants_map)
 
         logger.info(
             "Loaded %d url entries from %s for UrlSegmentTokenDatabase",
-            len(self.url_entries),
+            len(variants_map),
             db_path,
         )
-
-    def _rebuild_url_index(self) -> None:
-        """由 `_url_variants` 重建 url_entries 与首 token 索引。
-
-        初始化阶段可不加锁；refresh_article / remove_article 调用时需持有
-        `_lock`。这样文章刷新/删除后，匹配用的索引与内容保持一致。
-        """
-        url_entries: List[Tuple[str, List[int]]] = []
-        for url, variants in self._url_variants.items():
-            for variant in variants:
-                if variant:
-                    url_entries.append((url, list(variant)))
-        url_entries.sort(key=lambda entry: len(entry[1]), reverse=True)
-
-        # 带 BOS 的条目首 token 相同（全是 BOS），但它们只在 pos=0 参与匹配，
-        # 中间位置都是去 BOS 的真实文本首 token，分布较散，过滤效果好。
-        first_token_index: dict[int, List[Tuple[str, List[int]]]] = defaultdict(list)
-        for url, entry_ids in url_entries:
-            first_token_index[entry_ids[0]].append((url, entry_ids))
-
-        self.url_entries = url_entries
-        self._first_token_index = first_token_index
-
-    def _match_segments(
-        self, token_list: List[int], request_id: Optional[str] = None
-    ) -> List[Tuple[int, int, str]]:
-        """在 token 流中匹配 url 对应的区间，返回 [(start, end, url)]（按位置升序）。
-
-        若 request_id 已通过 set_request_urls 注册了有序 url 列表，则只在这些
-        url 中做引导匹配（O(K)，K 为本请求 url 数）；否则退化为全库扫描。
-        """
-        if request_id is not None:
-            urls = self._request_input_urls.get(request_id)
-            if urls is not None:
-                return self._guided_match(token_list, urls)
-        return self._full_scan_match(token_list)
-
-    def _guided_match(
-        self, token_list: List[int], urls: List[str]
-    ) -> List[Tuple[int, int, str]]:
-        """已知 url 有序列表时的引导匹配：只在这些 url 中找边界。
-
-        由于 prompt 是各 url 文本的拼接，整体 tokenize 时边界处可能发生
-        token 合并，因此不能简单按各 url 的 token 长度累加切分，而需要在
-        当前位置附近的小窗口内搜索该 url 的 token 序列。
-        """
-        num_tokens = len(token_list)
-        matches: List[Tuple[int, int, str]] = []
-        pos = 0
-        # 边界合并导致的偏移通常不超过几个 token，给 16 的搜索窗口足够
-        search_window = 16
-
-        for url in urls:
-            variants = self._url_variants.get(url)
-            if not variants:
-                continue
-            found = False
-            window_end = min(pos + search_window, num_tokens)
-            for search_pos in range(pos, window_end):
-                for variant in variants:
-                    vlen = len(variant)
-                    if search_pos + vlen > num_tokens:
-                        continue
-                    if token_list[search_pos : search_pos + vlen] == variant:
-                        matches.append((search_pos, search_pos + vlen, url))
-                        pos = search_pos + vlen
-                        found = True
-                        break
-                if found:
-                    break
-        return matches
-
-    def _full_scan_match(
-        self, token_list: List[int]
-    ) -> List[Tuple[int, int, str]]:
-        """全库扫描匹配（无 url 列表时的兜底）。"""
-        num_tokens = len(token_list)
-        matches: List[Tuple[int, int, str]] = []
-
-        pos = 0
-        while pos < num_tokens:
-            # 只查首 token 相同的条目，大幅减少比较次数
-            first_token = token_list[pos]
-            candidates = self._first_token_index.get(first_token)
-            if not candidates:
-                pos += 1
-                continue
-            for url, entry_ids in candidates:
-                entry_len = len(entry_ids)
-                if pos + entry_len > num_tokens:
-                    continue
-                if token_list[pos : pos + entry_len] == entry_ids:
-                    matches.append((pos, pos + entry_len, url))
-                    pos += entry_len
-                    break
-            else:
-                # 当前位置没有匹配到任何文本，向后移动一个 token
-                pos += 1
-        return matches
 
     @_lmcache_nvtx_annotate
     def process_tokens(
@@ -622,7 +495,9 @@ class UrlSegmentTokenDatabase(TokenDatabase):
         segments: List[Tuple[int, int, Optional[str]]] = []
         prev_end = 0
         matched_urls: set[str] = set()
-        for start, end, url in self._match_segments(token_list, request_id):
+        # 引导匹配：上层若注册了本请求的有序 url 列表，只在这些 url 里找边界
+        urls = self._request_input_urls.get(request_id) if request_id is not None else None
+        for start, end, url in self.index.match(token_list, urls):
             if start > prev_end:
                 segments.append((prev_end, start, None))
             segments.append((start, end, url))
@@ -646,22 +521,15 @@ class UrlSegmentTokenDatabase(TokenDatabase):
                 chunk_hash = self._hash_tokens(token_list[sub_start:sub_end])
                 chunks.append((sub_start, sub_end, url, chunk_hash))
                 if url is not None:
-                    self._register_article_chunk(url, chunk_hash)
+                    self.registry.register_chunk(url, chunk_hash)
 
-        # 记录该请求对各 url 的引用次数（每次 process_tokens 记 +1），并
-        # 立刻增加文章引用计数。dec_ref 在请求结束时按次数成对扣减，避免
-        # 同一 request 多次 lookup 造成计数泄漏。
+        # 记录该请求对各 url 的命中（热度），供 ③ Proactive Refresh 调度。
         if request_id is not None and matched_urls:
             with self._lock:
-                ref_counts = self._request_urls.setdefault(request_id, {})
                 now = time.time()
                 for url in matched_urls:
-                    ref_counts[url] = ref_counts.get(url, 0) + 1
                     self.url_access_counts[url] = self.url_access_counts.get(url, 0) + 1
                     self.url_last_access[url] = now
-                    article = self.articles.get(url)
-                    if article is not None:
-                        article.ref_cnt += 1
 
         for sub_start, sub_end, _url, chunk_hash in chunks:
             if make_key:
@@ -673,44 +541,13 @@ class UrlSegmentTokenDatabase(TokenDatabase):
     # 文章级元数据管理（仅内存）
     # ------------------------------------------------------------------
 
-    def _register_article_chunk(self, url: str, chunk_hash: int) -> None:
-        """登记一个 chunk 属于某篇文章，幂等。"""
-        with self._lock:
-            article = self.articles.get(url)
-            if article is None:
-                article = ArticleCacheMetadata(
-                    url=url,
-                    chunk_hashes=[],
-                    created_at=int(time.time()),
-                )
-                self.articles[url] = article
-                logger.info(
-                    "Registered article metadata: %s (first chunk hash %d)",
-                    url,
-                    chunk_hash,
-                )
-            if chunk_hash not in article.chunk_hashes:
-                article.chunk_hashes.append(chunk_hash)
-            self.hash_to_url[chunk_hash] = url
-
     def get_article(self, url: str) -> Optional[ArticleCacheMetadata]:
         """查询某篇文章的元数据。"""
-        with self._lock:
-            article = self.articles.get(url)
-            if article is None:
-                return None
-            # 返回副本，避免外部修改内部状态
-            return ArticleCacheMetadata(
-                url=article.url,
-                chunk_hashes=list(article.chunk_hashes),
-                created_at=article.created_at,
-                ref_cnt=article.ref_cnt,
-            )
+        return self.registry.get(url)
 
     def get_url_by_chunk_hash(self, chunk_hash: int) -> Optional[str]:
         """查询某段 KV cache 对应的来源 url"""
-        with self._lock:
-            return self.hash_to_url.get(chunk_hash)
+        return self.registry.get_url_by_chunk_hash(chunk_hash)
 
     def get_url_access_count(self, url: str) -> int:
         """查询某 url 的累计命中次数（热度，供 ③ Proactive Refresh 调度）。"""
@@ -780,94 +617,24 @@ class UrlSegmentTokenDatabase(TokenDatabase):
                 chunk = v[i : i + self.chunk_size]
                 new_hashes.add(self._hash_tokens(chunk))
 
-        with self._lock:
-            # 先更新匹配索引，否则刷新后新文本匹配不到、旧文本仍会被命中
-            self._url_variants[url] = variants
-            self._rebuild_url_index()
-
-            article = self.articles.get(url)
-            if article is None:
-                for h in new_hashes:
-                    self.hash_to_url[h] = url
-                self.articles[url] = ArticleCacheMetadata(
-                    url=url,
-                    chunk_hashes=list(new_hashes),
-                    created_at=int(time.time()),
-                )
-                logger.info(
-                    "Refresh article %s: not found, registered %d new hashes",
-                    url,
-                    len(new_hashes),
-                )
-                return list(new_hashes), []
-
-            old_hashes = set(article.chunk_hashes)
-            stale = list(old_hashes - new_hashes)
-            fresh = list(new_hashes - old_hashes)
-
-            # 清理失效 hash 的反向索引
-            for h in stale:
-                self.hash_to_url.pop(h, None)
-            # 登记新增 hash
-            for h in fresh:
-                self.hash_to_url[h] = url
-
-            article.chunk_hashes = list(new_hashes)
-            article.created_at = int(time.time())
-
-            logger.info(
-                "Refresh article %s: %d fresh, %d stale",
-                url,
-                len(fresh),
-                len(stale),
-            )
-            return fresh, stale
+        # 先换匹配索引，再算账本差集。两步各持各的锁，不再是一把大锁下的
+        # 原子操作；但 hash 是内容的纯函数，两步之间即使有并发请求，新文本
+        # 切出的 hash 天然 miss 旧账本，不会错命中旧 KV，故窗口安全。
+        self.index.set(url, variants)
+        return self.registry.refresh(url, new_hashes)
 
     def remove_article(self, url: str) -> Optional[List[int]]:
         """删除某篇文章的元数据，返回它包含的 chunk hash 列表（供调用方驱逐 KV）。"""
-        with self._lock:
-            # 同步移除匹配索引，否则被删除的文章仍能被后续 prompt 命中
-            self._url_variants.pop(url, None)
-            self._rebuild_url_index()
-
-            article = self.articles.pop(url, None)
-            if article is None:
-                return None
-            for h in article.chunk_hashes:
-                self.hash_to_url.pop(h, None)
-            logger.info(
-                "Removed article metadata: %s (%d chunks)",
-                url,
-                len(article.chunk_hashes),
-            )
-            return list(article.chunk_hashes)
-
-    def inc_ref(self, url: str) -> None:
-        """文章被新请求引用时 +1。"""
-        with self._lock:
-            article = self.articles.get(url)
-            if article is not None:
-                article.ref_cnt += 1
-
-    def dec_ref(self, url: str, count: int = 1) -> None:
-        """请求结束不再引用时按引用次数扣减。"""
-        with self._lock:
-            article = self.articles.get(url)
-            if article is not None:
-                article.ref_cnt = max(0, article.ref_cnt - count)
-
-    def get_request_urls(self, request_id: str) -> set[str]:
-        """返回某请求命中的所有 url（副本）。"""
-        with self._lock:
-            return set(self._request_urls.get(request_id, {}))
+        # 同步移除匹配索引，否则被删除的文章仍能被后续 prompt 命中
+        self.index.remove(url)
+        return self.registry.remove(url)
 
     def set_request_urls(self, request_id: str, urls: List[str]) -> None:
         """注册某请求的有序 url 列表，启用引导匹配（避免全库扫描）。"""
         with self._lock:
             self._request_input_urls[request_id] = list(urls)
 
-    def clear_request(self, request_id: str) -> dict[str, int]:
-        """清除某请求的记录，返回 {url: 引用次数}（供 dec_ref 使用）。"""
+    def clear_request(self, request_id: str) -> None:
+        """清除某请求的引导匹配输入（request_id -> url 列表）。"""
         with self._lock:
             self._request_input_urls.pop(request_id, None)
-            return self._request_urls.pop(request_id, {})
