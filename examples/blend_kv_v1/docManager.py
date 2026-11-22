@@ -1,6 +1,6 @@
+import asyncio
 import json
 import os
-import threading
 from typing import Dict, List, Optional, Tuple
 
 
@@ -13,9 +13,6 @@ class RAG_Database:
                 "http://example.com/doc1": "文档1的文本内容...",
                 "http://example.com/doc2": "文档2的文本内容..."
             }
-
-        加载顺序即 url 的索引顺序，必须与子进程 LMCacheLookupServer
-        读取同一个 rag_db.json 时的顺序一致（引导匹配靠索引反查）。
 
         :param rag_db_path: JSON 文件路径，默认 rag_db.json
         """
@@ -36,10 +33,6 @@ class RAG_Database:
         """
         return self.url_to_text.get(url, None)
 
-    def get_urls(self) -> List[str]:
-        """按 JSON 加载顺序返回全部 url（供索引编码/反查使用）。"""
-        return list(self.url_to_text.keys())
-
     def __contains__(self, url: str) -> bool:
         return url in self.url_to_text
 
@@ -48,15 +41,40 @@ class RAG_Database:
 
 
 class DocCacheManager:
-    def __init__(self, rag_database):
+    def __init__(
+        self, rag_database: RAG_Database, *, ipc_endpoint: Optional[str] = None
+    ):
         self.rag_database = rag_database
-        self.request_list = []
-        self.request_cnt = 0
-        self.url_list = list(rag_database.url_to_text.keys())
+        self.ipc_endpoint = ipc_endpoint
 
-    def generate_request_id(self, urls, prefix="rag_req") -> str:
-        idx_list = [self.url_list.index(u) for u in urls]
-        request_id = f"{prefix}_{self.request_cnt}|{','.join(map(str, idx_list))}"
-        self.request_cnt += 1
-        self.request_list.append(request_id)
-        return request_id
+    async def register_request(
+        self, request_id: str, document_spans: List[Tuple[int, int, str]]
+    ) -> None:
+        """Register document token spans before submitting a model request."""
+        await asyncio.to_thread(self._send_document_spans, request_id, document_spans)
+
+    async def unregister_request(self, request_id: str) -> None:
+        """Remove the worker's document spans when the request ends."""
+        await asyncio.to_thread(self._send_document_spans, request_id, None)
+
+    def _send_document_spans(
+        self, request_id: str, document_spans: Optional[List[Tuple[int, int, str]]]
+    ) -> None:
+        if self.ipc_endpoint is None:
+            raise RuntimeError("Configure an IPC endpoint to register document spans")
+
+        import zmq
+        from lmcache.v1.lookup_client.lmcache_lookup_client import (
+            DOCUMENT_SPANS_MESSAGE,
+        )
+
+        payload = json.dumps([request_id, document_spans]).encode("utf-8")
+        with zmq.Context() as context, context.socket(zmq.REQ) as socket:
+            socket.setsockopt(zmq.LINGER, 0)
+            socket.setsockopt(zmq.RCVTIMEO, 5000)
+            socket.setsockopt(zmq.SNDTIMEO, 5000)
+            socket.connect(self.ipc_endpoint)
+            socket.send_multipart([DOCUMENT_SPANS_MESSAGE, payload])
+            reply = socket.recv()
+        if reply != b"ok":
+            raise RuntimeError(reply.decode("utf-8"))

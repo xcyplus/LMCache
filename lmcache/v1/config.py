@@ -135,8 +135,8 @@ class LMCacheEngineConfig:
     # When set, uses external lookup client instead of regular lookup server
     external_lookup_client: Optional[str] = None
 
-    # RAG metadata (url -> text) file used by UrlSegmentTokenDatabase to
-    # locate text segments without separators in the prompt
+    # RAG corpus path. Setting it with blending selects URL-aware chunking;
+    # request document boundaries are registered separately.
     rag_db_path: Optional[str] = None
 
     @staticmethod

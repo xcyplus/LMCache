@@ -483,6 +483,7 @@ class LMCacheConnectorV1Impl:
                         token_mask[:lmcache_cached_tokens],
                         kvcaches=kvcaches,
                         slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                        request_id=request.req_id,
                     )
                 else:
                     layerwise_retriever = self.lmcache_engine.retrieve_layer(
@@ -490,6 +491,7 @@ class LMCacheConnectorV1Impl:
                         token_mask[:lmcache_cached_tokens],
                         kvcaches=kvcaches,
                         slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                        request_id=request.req_id,
                         sync=sync,
                     )
                     # NOTE: retrieve for two layers at the first layer
@@ -502,6 +504,7 @@ class LMCacheConnectorV1Impl:
                     token_mask[:lmcache_cached_tokens],
                     kvcaches=kvcaches,
                     slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                    request_id=request.req_id,
                 )
 
                 # Check the result
@@ -637,6 +640,7 @@ class LMCacheConnectorV1Impl:
                     mask=store_mask,
                     kvcaches=kvcaches,
                     slot_mapping=slot_mapping,
+                    request_id=request.req_id,
                     offset=skip_leading_tokens,
                     sync=sync,
                 )
@@ -733,6 +737,7 @@ class LMCacheConnectorV1Impl:
                 mask=store_mask,
                 kvcaches=kvcaches,
                 slot_mapping=slot_mapping,
+                request_id=request.req_id,
                 offset=skip_leading_tokens,
                 transfer_spec=request.disagg_spec,
             )

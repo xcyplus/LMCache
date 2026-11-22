@@ -2,8 +2,6 @@
 # Standard
 from typing import Iterable, List, Optional, Tuple, Union
 import abc
-import json
-import os
 import threading
 import time
 
@@ -19,7 +17,6 @@ from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.doc_index import (
     ArticleCacheMetadata,
     ArticleRegistry,
-    UrlSegmentIndex,
 )
 
 logger = init_logger(__name__)
@@ -377,22 +374,10 @@ class SegmentTokenDatabase(TokenDatabase):
 
 
 class UrlSegmentTokenDatabase(TokenDatabase):
-    """用 RAG 元数据 (url -> 文本) 定位 token 区间，不再依赖分隔符。
+    """Chunk prompts using document token spans registered by the application.
 
-    工作方式：
-    1. 初始化时从 `config.rag_db_path` 指向的 JSON 读入 url -> 文本，并用
-       tokenizer 把每条文本编码成 token id 序列（同时保留带 BOS 与去掉
-       BOS 两种形式，兼容 prompt 首段与后续段的不同处理方式）。
-    2. `process_tokens` 在 token 流里做最长匹配，得到每个文本对应的
-       [start, end) 区间；没有匹配上的部分整体作为一个区间。每个区间内部
-       再按 `chunk_size` 切成子块，保证整条 prompt 都被覆盖，避免出现未
-       加载的 KV 空洞。
-    3. 每个子块的 key 只由该子块内容 hash 得到（与位置、前缀无关），因此
-       同样的文档在 prompt 中换顺序后仍然能命中；文档内容更新时只有变化
-       的子块失效，其余复用。
-    4. 匹配索引与文章账本（`UrlSegmentIndex` 与 `ArticleRegistry`）拆到
-       `lmcache.v1.doc_index`，仅存内存，与 CPU 内存 KV cache 同生命周期。
-       支持 `refresh_article` 增量刷新、`remove_article` 驱逐。
+    Each span and each gap is split independently into content-hashed chunks.
+    The article registry records URL ownership for incremental refresh.
     """
 
     def __init__(
@@ -408,49 +393,17 @@ class UrlSegmentTokenDatabase(TokenDatabase):
         assert metadata is not None, "metadata is required for UrlSegmentTokenDatabase"
         self.tokenizer = AutoTokenizer.from_pretrained(metadata.model_name)
 
-        # ① 匹配索引 + ② 账本：拆到 lmcache.v1.doc_index，各自持有自己的锁
-        self.index = UrlSegmentIndex()
         self.registry = ArticleRegistry()
 
-        # request_id -> 上层传入的有序 url 列表（引导匹配，避免全库扫描）
-        self._request_input_urls: dict[str, List[str]] = {}
+        # request_id -> 通过 IPC 注册的文档 token 区间
+        self._request_document_spans: dict[str, tuple[tuple[int, int, str], ...]] = {}
         # url -> 累计命中次数（process_tokens 每次匹配到该 url 时 +1），
         # 供 ③ Proactive Refresh 按热度挑选后台刷新候选
         self.url_access_counts: dict[str, int] = {}
         # url -> 最近一次命中时间戳（热度 tie-break / 新鲜度参考）
         self.url_last_access: dict[str, float] = {}
-        # 保护 _request_input_urls / 热度计数的并发写
+        # 保护 请求文档区间 / 热度计数的并发写
         self._lock = threading.Lock()
-
-        db_path = config.rag_db_path if config is not None else None
-        if db_path is None or not os.path.exists(db_path):
-            logger.warning(
-                "UrlSegmentTokenDatabase: rag_db_path '%s' 不存在，"
-                "所有区间都会退化为按内容 hash 处理",
-                db_path,
-            )
-            return
-
-        with open(db_path, "r", encoding="utf-8") as f:
-            url_to_text = json.load(f)
-
-        variants_map: dict[str, List[List[int]]] = {}
-        for url, text in url_to_text.items():
-            if not text:
-                continue
-            token_ids = self.tokenizer.encode(text)
-            # NOTE: 与示例脚本保持一致：首段保留 BOS，其余段去掉 BOS
-            variants: List[List[int]] = [list(token_ids)]
-            if len(token_ids) > 1:
-                variants.append(list(token_ids[1:]))
-            variants_map[url] = variants
-        self.index.load(variants_map)
-
-        logger.info(
-            "Loaded %d url entries from %s for UrlSegmentTokenDatabase",
-            len(variants_map),
-            db_path,
-        )
 
     @_lmcache_nvtx_annotate
     def process_tokens(
@@ -466,76 +419,85 @@ class UrlSegmentTokenDatabase(TokenDatabase):
 
         每个区间的 key 由区间内容单独 hash，不含前缀信息，所以位置无关。
         """
-        num_falses = 0
+        masked_prefix_length = 0
         if mask is not None:
-            num_falses = mask.numel() - mask.long().sum().item()
+            masked_prefix_length = mask.numel() - mask.long().sum().item()
 
         if tokens is None:
             # 兼容 hashes/offsets 输入（无法定位 url，只能透传已有 hash）
             assert hashes is not None and offsets is not None, (
                 "If tokens are not provided, hashes and offsets must be provided."
             )
-            start_idx = 0
-            for hash_val, offset in zip(hashes, offsets, strict=False):
-                end_idx = start_idx + offset
-                if start_idx >= num_falses:
+            chunk_start = 0
+            for chunk_hash, chunk_length in zip(hashes, offsets, strict=False):
+                chunk_end = chunk_start + chunk_length
+                if chunk_start >= masked_prefix_length:
                     if make_key:
-                        yield start_idx, end_idx, self._make_key_by_hash(hash_val)
+                        yield chunk_start, chunk_end, self._make_key_by_hash(chunk_hash)
                     else:
-                        yield start_idx, end_idx, hash_val
-                start_idx = end_idx
+                        yield chunk_start, chunk_end, chunk_hash
+                chunk_start = chunk_end
             return
 
         if isinstance(tokens, torch.Tensor):
-            token_list = tokens.cpu().tolist()
+            prompt_tokens = tokens.cpu().tolist()
         else:
-            token_list = list(tokens)
+            prompt_tokens = list(tokens)
 
-        # 把命中的文本区间和未命中的空隙拼成完整覆盖
-        segments: List[Tuple[int, int, Optional[str]]] = []
-        prev_end = 0
+        # 用已匹配的文档区间和无 URL 的区间覆盖整个 prompt。
+        prompt_spans: List[Tuple[int, int, Optional[str]]] = []
+        previous_span_end = 0
         matched_urls: set[str] = set()
-        # 引导匹配：上层若注册了本请求的有序 url 列表，只在这些 url 里找边界
-        urls = self._request_input_urls.get(request_id) if request_id is not None else None
-        for start, end, url in self.index.match(token_list, urls):
-            if start > prev_end:
-                segments.append((prev_end, start, None))
-            segments.append((start, end, url))
+        registered_spans = (
+            self._request_document_spans.get(request_id, ())
+            if request_id is not None
+            else ()
+        )
+        for span_start, registered_end, url in registered_spans:
+            if span_start >= len(prompt_tokens):
+                break
+            span_end = min(registered_end, len(prompt_tokens))
+            if span_start > previous_span_end:
+                # 补上当前文档前的无 URL 文本，如系统提示或文档间的说明。
+                prompt_spans.append((previous_span_end, span_start, None))
+            # 加入当前文档的 token 区间，切块时按 URL 登记归属。
+            prompt_spans.append((span_start, span_end, url))
             if url is not None:
                 matched_urls.add(url)
-            prev_end = end
-        if prev_end < len(token_list):
-            segments.append((prev_end, len(token_list), None))
+            previous_span_end = span_end
+        if previous_span_end < len(prompt_tokens):
+            # 补上最后一篇文档后的文字；没有文档时，这段覆盖整个 prompt。
+            prompt_spans.append((previous_span_end, len(prompt_tokens), None))
 
         # 先把所有子块算完并登记文章元数据，再开始 yield。这样即使调用方
         # 中途 break（lookup / retrieve 遇到 miss 就会），文章元数据依然完整。
-        chunks: List[Tuple[int, int, Optional[str], int]] = []
-        for start, end, url in segments:
+        hashed_chunks: List[Tuple[int, int, int]] = []
+        for span_start, span_end, url in prompt_spans:
             # 每个段（文章或空隙）内部再按 chunk_size 切分成子块，
             # 每个子块单独内容 hash，支持增量刷新与流水线并行。
-            for sub_start in range(start, end, self.chunk_size):
-                sub_end = min(sub_start + self.chunk_size, end)
+            for chunk_start in range(span_start, span_end, self.chunk_size):
+                chunk_end = min(chunk_start + self.chunk_size, span_end)
                 # mask 前缀部分的 token 由 vLLM 自己算过，这里跳过
-                if sub_start < num_falses:
+                if chunk_start < masked_prefix_length:
                     continue
-                chunk_hash = self._hash_tokens(token_list[sub_start:sub_end])
-                chunks.append((sub_start, sub_end, url, chunk_hash))
+                chunk_hash = self._hash_tokens(prompt_tokens[chunk_start:chunk_end])
+                hashed_chunks.append((chunk_start, chunk_end, chunk_hash))
                 if url is not None:
                     self.registry.register_chunk(url, chunk_hash)
 
         # 记录该请求对各 url 的命中（热度），供 ③ Proactive Refresh 调度。
         if request_id is not None and matched_urls:
             with self._lock:
-                now = time.time()
+                access_time = time.time()
                 for url in matched_urls:
                     self.url_access_counts[url] = self.url_access_counts.get(url, 0) + 1
-                    self.url_last_access[url] = now
+                    self.url_last_access[url] = access_time
 
-        for sub_start, sub_end, _url, chunk_hash in chunks:
+        for chunk_start, chunk_end, chunk_hash in hashed_chunks:
             if make_key:
-                yield sub_start, sub_end, self._make_key_by_hash(chunk_hash)
+                yield chunk_start, chunk_end, self._make_key_by_hash(chunk_hash)
             else:
-                yield sub_start, sub_end, chunk_hash
+                yield chunk_start, chunk_end, chunk_hash
 
     # ------------------------------------------------------------------
     # 文章级元数据管理（仅内存）
@@ -606,7 +568,7 @@ class UrlSegmentTokenDatabase(TokenDatabase):
         若配合 ③ ProactiveRefresh 在空闲窗口后台盲编码，则下次请求直接命中。
         """
         new_ids = self.tokenizer.encode(new_text)
-        # 同时考虑带 BOS 与去 BOS 两种形式（与 __init__ 加载逻辑一致）
+        # 同时考虑带 BOS 与去 BOS 两种形式
         variants = [list(new_ids)]
         if len(new_ids) > 1:
             variants.append(list(new_ids[1:]))
@@ -617,24 +579,30 @@ class UrlSegmentTokenDatabase(TokenDatabase):
                 chunk = v[i : i + self.chunk_size]
                 new_hashes.add(self._hash_tokens(chunk))
 
-        # 先换匹配索引，再算账本差集。两步各持各的锁，不再是一把大锁下的
-        # 原子操作；但 hash 是内容的纯函数，两步之间即使有并发请求，新文本
-        # 切出的 hash 天然 miss 旧账本，不会错命中旧 KV，故窗口安全。
-        self.index.set(url, variants)
         return self.registry.refresh(url, new_hashes)
 
     def remove_article(self, url: str) -> Optional[List[int]]:
         """删除某篇文章的元数据，返回它包含的 chunk hash 列表（供调用方驱逐 KV）。"""
-        # 同步移除匹配索引，否则被删除的文章仍能被后续 prompt 命中
-        self.index.remove(url)
         return self.registry.remove(url)
 
-    def set_request_urls(self, request_id: str, urls: List[str]) -> None:
-        """注册某请求的有序 url 列表，启用引导匹配（避免全库扫描）。"""
+    def set_request_document_spans(
+        self, request_id: str, spans: list[tuple[int, int, str]]
+    ) -> None:
+        previous_end = 0
+        for start, end, url in spans:
+            if (
+                type(start) is not int
+                or type(end) is not int
+                or start < previous_end
+                or end <= start
+                or not isinstance(url, str)
+                or not url
+            ):
+                raise ValueError("Expected ordered, non-overlapping token spans with URLs")
+            previous_end = end
         with self._lock:
-            self._request_input_urls[request_id] = list(urls)
+            self._request_document_spans[request_id] = tuple(spans)
 
-    def clear_request(self, request_id: str) -> None:
-        """清除某请求的引导匹配输入（request_id -> url 列表）。"""
+    def remove_request_document_spans(self, request_id: str) -> None:
         with self._lock:
-            self._request_input_urls.pop(request_id, None)
+            self._request_document_spans.pop(request_id, None)

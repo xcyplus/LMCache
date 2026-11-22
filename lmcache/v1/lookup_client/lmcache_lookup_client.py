@@ -17,12 +17,15 @@ from lmcache.v1.cache_engine import LMCacheEngine
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
 from lmcache.v1.rpc_utils import get_zmq_rpc_path_lmcache
+from lmcache.v1.token_database import UrlSegmentTokenDatabase
 
 if TYPE_CHECKING:
     # Third Party
     from vllm.config import VllmConfig
 
 logger = init_logger(__name__)
+DOCUMENT_SPANS_ENDPOINT_ENV = "LMCACHE_DOCUMENT_SPANS_ENDPOINT"
+DOCUMENT_SPANS_MESSAGE = b"document-spans-v1"
 
 
 class LMCacheLookupClient(LookupClientInterface):
@@ -109,54 +112,60 @@ class LMCacheLookupServer:
         )
 
         self.lmcache_engine = lmcache_engine
-        # url -> 索引 映射（解析 request_id 里编码的索引，支持引导匹配）
-        self._url_list = self._load_url_list(lmcache_engine)
+        document_spans_endpoint = os.getenv(DOCUMENT_SPANS_ENDPOINT_ENV)
+        if document_spans_endpoint:
+            if vllm_config.parallel_config.tensor_parallel_size != 1:
+                raise ValueError("Document span registration requires one TP worker")
+            self.socket.bind(document_spans_endpoint)
         self.running = True
 
         def process_request():
             while self.running:
-                # try:
-                # request = self.socket.recv()
                 frames = self.socket.recv_multipart(copy=False)
-                token_frames = frames[:-1]
-                request_id = frames[-1].bytes.decode("utf-8")
-                token_ids = self.decoder.decode(token_frames)
-                # 解析 request_id 里编码的 url 索引，注册引导匹配
-                _, urls = self._decode_urls(request_id)
-                if urls:
-                    self.lmcache_engine.set_request_urls(request_id, urls)
-                result = self.lmcache_engine.lookup(
-                    token_ids, request_id=request_id, pin=True
-                )
-                response = result.to_bytes(4, "big")
+                match self._message_type(frames, document_spans_endpoint):
+                    case "document_spans":
+                        response = self._handle_document_spans(frames[1].bytes)
+                    case "lookup":
+                        response = self._handle_lookup(frames)
                 self.socket.send(response)
-                # except Exception as e:
-                #    logger.error("Error in LMCache lookup server: %s", e)
-                #    break
-                # continue
 
         self.thread = threading.Thread(target=process_request, daemon=True)
         self.thread.start()
 
-    def _load_url_list(self, lmcache_engine: LMCacheEngine) -> list[str]:
-        """从 rag_db.json 加载有序 url 列表，供索引编码引导匹配反查。"""
-        path = getattr(lmcache_engine.config, "rag_db_path", None)
-        if not path or not os.path.exists(path):
-            return []
-        with open(path, "r", encoding="utf-8") as f:
-            return list(json.load(f).keys())
+    @staticmethod
+    def _message_type(frames: list[zmq.Frame], endpoint: Optional[str]) -> str:
+        # DocCacheManager 的注册或撤销请求带有固定标记。
+        if endpoint and len(frames) == 2 and frames[0].bytes == DOCUMENT_SPANS_MESSAGE:
+            return "document_spans"
+        return "lookup"
 
-    def _decode_urls(self, request_id: str) -> tuple[str, Optional[list[str]]]:
-        """解析 request_id 里编码的 url 索引（"rid|i,j"），返回 (urls 或 None)。"""
-        if "|" not in request_id:
-            return request_id, None
-        rid, idx_str = request_id.split("|", 1)
+    def _handle_lookup(self, frames: list[zmq.Frame]) -> bytes:
+        # Lookup client 把请求 ID 放在最后一帧。
+        request_id = frames[-1].bytes.decode("utf-8")
+        token_ids = self.decoder.decode(frames[:-1])
+        result = self.lmcache_engine.lookup(token_ids, request_id=request_id, pin=True)
+        return result.to_bytes(4, "big")
+
+    def _handle_document_spans(self, payload: bytes) -> bytes:
+        """Register the request's document spans or remove them when spans is null."""
         try:
-            idxs = [int(x) for x in idx_str.split(",") if x]
-            urls = [self._url_list[i] for i in idxs if 0 <= i < len(self._url_list)]
-            return rid, urls
-        except (ValueError, IndexError):
-            return request_id, None
+            request_id, spans = json.loads(payload)
+            if not isinstance(request_id, str) or not request_id:
+                raise ValueError("Expected a non-empty request ID")
+            database = self.lmcache_engine.token_database
+            if not isinstance(database, UrlSegmentTokenDatabase):
+                raise ValueError("Document span registration requires URL-aware blending")
+            if spans is None:
+                database.remove_request_document_spans(request_id)
+            else:
+                if not isinstance(spans, list):
+                    raise ValueError("Expected a list of document spans")
+                database.set_request_document_spans(
+                    request_id, [tuple(span) for span in spans]
+                )
+        except (TypeError, ValueError) as exc:
+            return str(exc).encode("utf-8")
+        return b"ok"
 
     def close(self):
         self.socket.close(linger=0)
