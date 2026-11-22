@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from typing import TYPE_CHECKING, Optional
+import json
+import os
 import threading
 
 # Third Party
@@ -107,6 +109,8 @@ class LMCacheLookupServer:
         )
 
         self.lmcache_engine = lmcache_engine
+        # url -> 索引 映射（解析 request_id 里编码的索引，支持引导匹配）
+        self._url_list = self._load_url_list(lmcache_engine)
         self.running = True
 
         def process_request():
@@ -117,6 +121,10 @@ class LMCacheLookupServer:
                 token_frames = frames[:-1]
                 request_id = frames[-1].bytes.decode("utf-8")
                 token_ids = self.decoder.decode(token_frames)
+                # 解析 request_id 里编码的 url 索引，注册引导匹配
+                _, urls = self._decode_urls(request_id)
+                if urls:
+                    self.lmcache_engine.set_request_urls(request_id, urls)
                 result = self.lmcache_engine.lookup(
                     token_ids, request_id=request_id, pin=True
                 )
@@ -129,6 +137,26 @@ class LMCacheLookupServer:
 
         self.thread = threading.Thread(target=process_request, daemon=True)
         self.thread.start()
+
+    def _load_url_list(self, lmcache_engine: LMCacheEngine) -> list[str]:
+        """从 rag_db.json 加载有序 url 列表，供索引编码引导匹配反查。"""
+        path = getattr(lmcache_engine.config, "rag_db_path", None)
+        if not path or not os.path.exists(path):
+            return []
+        with open(path, "r", encoding="utf-8") as f:
+            return list(json.load(f).keys())
+
+    def _decode_urls(self, request_id: str) -> tuple[str, Optional[list[str]]]:
+        """解析 request_id 里编码的 url 索引（"rid|i,j"），返回 (urls 或 None)。"""
+        if "|" not in request_id:
+            return request_id, None
+        rid, idx_str = request_id.split("|", 1)
+        try:
+            idxs = [int(x) for x in idx_str.split(",") if x]
+            urls = [self._url_list[i] for i in idxs if 0 <= i < len(self._url_list)]
+            return rid, urls
+        except (ValueError, IndexError):
+            return request_id, None
 
     def close(self):
         self.socket.close(linger=0)

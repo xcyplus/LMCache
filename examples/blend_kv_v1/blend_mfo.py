@@ -14,6 +14,7 @@ from vllm.config import KVTransferConfig
 from vllm.engine.arg_utils import EngineArgs
 
 # First Party
+from docManager import RAG_Database
 from lmcache.integration.vllm.utils import ENGINE_NAME
 from lmcache.v1.cache_engine import LMCacheEngineBuilder
 
@@ -117,37 +118,6 @@ def parse_args():
 
     return parser.parse_args()
 
-
-class RAG_Database:
-    def __init__(self, json_path: str = "rag_db.json") -> None:
-        """从 JSON 文件加载 RAG 数据库。
-
-        JSON 文件格式：
-            {
-                "http://example.com/doc1": "文档1的文本内容...",
-                "http://example.com/doc2": "文档2的文本内容..."
-            }
-
-        :param json_path: JSON 文件路径，默认 rag_db.json
-        """
-        import json
-
-        self.json_path = json_path
-        self.url_to_text: dict[str, str] = {}
-
-        if os.path.exists(json_path):
-            with open(json_path, "r", encoding="utf-8") as f:
-                self.url_to_text = json.load(f)
-        else:
-            print(f"[RAG_Database] Warning: '{json_path}' not found, starting empty.")
-
-    def get_text(self, url: str) -> Optional[str]:
-        """根据 url 查询对应的文本内容。
-
-        :param url: 要查询的文档 url
-        :return: 对应的文本内容；url 不存在时返回 None
-        """
-        return self.url_to_text.get(url, None)
 
 
 def main():
