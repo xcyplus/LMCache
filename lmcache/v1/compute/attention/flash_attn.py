@@ -4,6 +4,7 @@ from vllm.attention import Attention
 from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
 from vllm.vllm_flash_attn import flash_attn_varlen_func, get_scheduler_metadata
 import torch
+from torch.nn.functional import scaled_dot_product_attention
 
 # First Party
 from lmcache.v1.compute.attention.abstract import AttentionInterface
@@ -99,3 +100,34 @@ class LMCFlashAttnBackend(AttentionInterface):
                 window_size=self.vllm_attn_impl.aot_sliding_window,
             )
         return None
+
+    def forward_selected(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        output: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply causal attention at the original positions of selected queries."""
+        key_positions = torch.arange(key.size(0), device=query.device)
+        key = key.transpose(0, 1).unsqueeze(0)
+        value = value.transpose(0, 1).unsqueeze(0)
+        left_window, _ = self.vllm_attn_impl.sliding_window
+        # Limit temporary attention masks, including on long prompts.
+        for start in range(0, len(positions), 128):
+            end = start + 128
+            query_positions = positions[start:end, None]
+            allowed = key_positions <= query_positions
+            if left_window >= 0:
+                allowed &= key_positions >= query_positions - left_window
+            result = scaled_dot_product_attention(
+                query[start:end].transpose(0, 1).unsqueeze(0),
+                key,
+                value,
+                attn_mask=allowed,
+                scale=self.vllm_attn_impl.scale,
+                enable_gqa=query.size(1) != key.size(1),
+            )
+            output[start:end].copy_(result.squeeze(0).transpose(0, 1))
+        return output

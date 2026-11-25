@@ -18,9 +18,8 @@ from vllm.engine.async_llm_engine import AsyncLLMEngine
 
 # First Party
 from docManager import DocCacheManager, RAG_Database
-from lmcache.v1.lookup_client.lmcache_lookup_client import (
-    DOCUMENT_SPANS_ENDPOINT_ENV,
-)
+from lmcache.v1.lookup_client.lmcache_lookup_client import DOCUMENT_SPANS_ENDPOINT_ENV
+from lmcache.v1.storage_backend.document_kv import DOCUMENT_KV_DIR_ENV
 
 
 def setup_environment_variables(rag_db_path: Optional[str] = None):
@@ -42,8 +41,7 @@ def setup_environment_variables(rag_db_path: Optional[str] = None):
     os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "5"
 
 
-def build_async_engine(model: str) -> AsyncLLMEngine:
-    """Async RAG example with explicit document token spans registered over IPC."""
+def build_async_engine(model: str, revision: Optional[str]) -> AsyncLLMEngine:
     ktc = KVTransferConfig(
         kv_connector="LMCacheConnectorV1",
         kv_role="kv_both",
@@ -51,10 +49,14 @@ def build_async_engine(model: str) -> AsyncLLMEngine:
 
     engine_args = AsyncEngineArgs(
         model=model,
+        revision=revision,
         kv_transfer_config=ktc,
         max_model_len=8000,
+        max_num_batched_tokens=8000,
+        max_num_seqs=1,
         gpu_memory_utilization=0.8,
         enable_prefix_caching=False,
+        enforce_eager=True,
     )
 
     return AsyncLLMEngine.from_engine_args(engine_args)
@@ -68,8 +70,6 @@ async def print_output(
 ):
 
     start = time.time()
-
-
     generated_text = None
     async for output in engine.generate(
         prompt={"prompt_token_ids": prompt},
@@ -88,7 +88,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model",
-        default="mistralai/Mistral-7B-Instruct-v0.2",
+        default="meta-llama/Llama-2-7b-chat-hf",
         help="Path or name of the model to use",
     )
     parser.add_argument(
@@ -97,17 +97,23 @@ def parse_args():
         help="Path to the RAG database (url -> text) JSON file "
         "(default: rag_db.json next to this script)",
     )
+    parser.add_argument("--revision", help="Pinned model revision for persistent KV")
+    parser.add_argument("--document-kv-dir", required=True, help="SSD cache directory")
     return parser.parse_args()
 
 
-async def run(model: str, rag_db_path: Optional[str]) -> None:
+async def run(
+    model: str, rag_db_path: Optional[str], document_kv_dir: str,
+    revision: Optional[str],
+) -> None:
     rag_db_path = rag_db_path or os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "rag_db.json"
     )
 
     setup_environment_variables(rag_db_path)
 
-    tokenizer = AutoTokenizer.from_pretrained(model)
+    os.environ[DOCUMENT_KV_DIR_ENV] = os.path.abspath(document_kv_dir)
+    tokenizer = AutoTokenizer.from_pretrained(model, revision=revision)
     rag_data = RAG_Database(rag_db_path)
     system_prompt = "You are a very helpful assistant."
     question = "请用一句话总结上述城市的特点。"
@@ -119,9 +125,12 @@ async def run(model: str, rag_db_path: Optional[str]) -> None:
     ]
 
     system_tokens = tokenizer.encode(system_prompt)
-    question_tokens = tokenizer.encode(question)[1:]
+    question_tokens = tokenizer.encode(question, add_special_tokens=False)
+    separator_tokens = tokenizer.encode(
+        "\n请参考下一段材料。\n", add_special_tokens=False
+    )
     document_tokens = {
-        url: tokenizer.encode(rag_data.get_text(url))[1:]
+        url: tokenizer.encode(rag_data.get_text(url), add_special_tokens=False)
         for url in (beijing_url, chongqing_url)
     }
     sampling_params = SamplingParams(temperature=0, top_p=0.95, max_tokens=200)
@@ -130,12 +139,14 @@ async def run(model: str, rag_db_path: Optional[str]) -> None:
         endpoint = f"ipc://{os.path.join(ipc_dir, 'register')}"
         os.environ[DOCUMENT_SPANS_ENDPOINT_ENV] = endpoint
         doc_cache_manager = DocCacheManager(rag_data, ipc_endpoint=endpoint)
-        engine = build_async_engine(model)
+        engine = build_async_engine(model, revision)
 
         for request_label, ordered_urls in requests:
             prompt = list(system_tokens)
             spans = []
             for url in ordered_urls:
+                if spans:
+                    prompt.extend(separator_tokens)
                 start = len(prompt)
                 prompt.extend(document_tokens[url])
                 spans.append((start, len(prompt), url))
@@ -153,7 +164,7 @@ async def run(model: str, rag_db_path: Optional[str]) -> None:
 
 def main():
     args = parse_args()
-    asyncio.run(run(model=args.model, rag_db_path=args.rag_db))
+    asyncio.run(run(args.model, args.rag_db, args.document_kv_dir, args.revision))
 
 
 if __name__ == "__main__":

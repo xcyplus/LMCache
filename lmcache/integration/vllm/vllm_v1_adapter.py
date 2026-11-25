@@ -30,6 +30,7 @@ from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.lookup_client import LookupClientFactory
 from lmcache.v1.offload_server.zmq_server import ZMQOffloadServer
+from lmcache.v1.storage_backend.document_kv import DOCUMENT_KV_DIR_ENV, DocumentKVStore
 from lmcache.v1.storage_backend.connector.nixl_connector_v3 import (
     NixlReceiverInfo,
 )
@@ -54,6 +55,7 @@ class LoadSpec:
     lmcache_cached_tokens: int
     # Whether the scheduler allow us to load the tokens
     can_load: bool
+    blend_documents: bool = False
 
 
 @dataclass
@@ -330,6 +332,27 @@ class LMCacheConnectorV1Impl:
         self.kv_role = vllm_config.kv_transfer_config.kv_role
 
         config = lmcache_get_config()
+        document_kv_dir = os.getenv(DOCUMENT_KV_DIR_ENV)
+        if document_kv_dir and (
+            not config.enable_blending
+            or not config.use_layerwise
+            or not config.rag_db_path
+            or not config.local_cpu
+            or config.enable_nixl
+            or config.external_lookup_client is not None
+            or self.kv_role != "kv_both"
+            or not vllm_config.model_config.enforce_eager
+            or vllm_config.cache_config.enable_prefix_caching
+            or vllm_config.parallel_config.tensor_parallel_size != 1
+            or vllm_config.parallel_config.pipeline_parallel_size != 1
+            or vllm_config.kv_transfer_config.get_from_extra_config(
+                "skip_last_n_tokens", 0
+            )
+        ):
+            raise ValueError(
+                "Document KV requires single-worker, eager URL-aware layerwise "
+                "blending, local CPU storage, and disabled vLLM prefix caching"
+            )
         self.layerwise_retrievers = []
         if role == KVConnectorRole.SCHEDULER:
             # Create lookup client using factory
@@ -354,6 +377,33 @@ class LMCacheConnectorV1Impl:
                     ENGINE_NAME,
                     self.lmcache_engine,
                     self.lmcache_engine.gpu_connector,
+                )
+
+            if document_kv_dir:
+                metadata = self.lmcache_engine.metadata
+                model_config = vllm_config.model_config
+                layerwise_model = self.blender.layerwise_model
+                rotary = layerwise_model.vllm_model.model.layers[0].self_attn.rotary_emb
+                if (
+                    layerwise_model.fused_rotary_emb is None
+                    or type(rotary).__name__ != "RotaryEmbedding"
+                    or metadata.kv_dtype != model_config.dtype
+                ):
+                    raise ValueError(
+                        "Document KV requires unscaled RoPE and model-dtype KV"
+                    )
+                model_revision = (
+                    getattr(model_config.hf_config, "_commit_hash", None)
+                    or model_config.revision
+                    or "default"
+                )
+                model_identity = f"{metadata.model_name}@{model_revision}"
+                self.lmcache_engine.document_kv_store = DocumentKVStore(
+                    document_kv_dir,
+                    model_identity,
+                    metadata.kv_shape[0],
+                    metadata.kv_shape[-2] * metadata.kv_shape[-1],
+                    metadata.kv_dtype,
                 )
 
             # Create lookup server using factory
@@ -473,6 +523,17 @@ class LMCacheConnectorV1Impl:
             token_mask[:masked_token_count] = False
 
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
+            if request.load_spec.blend_documents:
+                if len(tokens) <= lmcache_cached_tokens:
+                    raise RuntimeError("The complete document prompt must be scheduled")
+                self.blender.blend_documents(
+                    tokens,
+                    lmcache_cached_tokens,
+                    request.req_id,
+                    kvcaches=kvcaches,
+                    slot_mapping=slot_mapping,
+                )
+                continue
             if self.use_layerwise:
                 sync = True
                 # NOTE(Jiayi): Perform blending before layerwise prefix caching
@@ -795,6 +856,11 @@ class LMCacheConnectorV1Impl:
                 token_ids, request_id=request.request_id
             )
 
+        blend_documents = num_external_hit_tokens < 0
+        if blend_documents:
+            # Leave the final prompt token for vLLM to compute and sample.
+            num_external_hit_tokens = -num_external_hit_tokens - 1
+
         # When prompt length is divisible by the block size and all
         # blocks are cached, we need to recompute the last token.
         # This will be removed in the future if vLLM's scheduler provides
@@ -817,6 +883,7 @@ class LMCacheConnectorV1Impl:
             vllm_cached_tokens=num_computed_tokens,
             lmcache_cached_tokens=num_external_hit_tokens,
             can_load=False,
+            blend_documents=blend_documents,
         )
 
         if need_to_allocate <= 0:
@@ -922,7 +989,7 @@ class LMCacheConnectorV1Impl:
                 + scheduler_output.num_scheduled_tokens[request.req_id]
             )
             lmcache_cached_tokens = 0
-            if load_spec is not None:
+            if load_spec is not None and not load_spec.blend_documents:
                 lmcache_cached_tokens = load_spec.lmcache_cached_tokens
             request_tracker = RequestTracker.from_new_request(
                 request,
@@ -937,7 +1004,8 @@ class LMCacheConnectorV1Impl:
                 self._lmcache_chunk_size,
                 load_spec=load_spec,
                 skip_save=force_skip_save,
-                discard_partial_chunks=self._discard_partial_chunks,
+                discard_partial_chunks=self._discard_partial_chunks
+                and not (load_spec is not None and load_spec.blend_documents),
             )
             if req_meta is not None:
                 meta.add_request(req_meta)

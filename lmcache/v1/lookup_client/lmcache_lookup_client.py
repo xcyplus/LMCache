@@ -75,7 +75,7 @@ class LMCacheLookupClient(LookupClientInterface):
         for i in range(ranks):
             self.socket.send_multipart(token_bufs + [request_id_buf], copy=False)
             resp = self.socket.recv()
-            result = int.from_bytes(resp, "big")
+            result = int.from_bytes(resp, "big", signed=True)
             results.append(result)
         if not all(x == results[0] for x in results):
             raise RuntimeError(
@@ -143,8 +143,15 @@ class LMCacheLookupServer:
         # Lookup client 把请求 ID 放在最后一帧。
         request_id = frames[-1].bytes.decode("utf-8")
         token_ids = self.decoder.decode(frames[:-1])
+        if (
+            self.lmcache_engine.document_kv_store is not None
+            and len(token_ids) > 1
+            and self.lmcache_engine.token_database.get_request_document_spans(request_id)
+        ):
+            # The worker will construct the entire prefix, computing its gaps.
+            return (-len(token_ids)).to_bytes(4, "big", signed=True)
         result = self.lmcache_engine.lookup(token_ids, request_id=request_id, pin=True)
-        return result.to_bytes(4, "big")
+        return result.to_bytes(4, "big", signed=True)
 
     def _handle_document_spans(self, payload: bytes) -> bytes:
         """Register the request's document spans or remove them when spans is null."""

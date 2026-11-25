@@ -414,6 +414,7 @@ class UrlSegmentTokenDatabase(TokenDatabase):
         mask: Optional[torch.Tensor] = None,
         make_key: bool = True,
         request_id: Optional[str] = None,
+        include_document_chunks: bool = True,
     ) -> Iterable[Tuple[int, int, Union[CacheEngineKey, int]]]:
         """根据 url 元数据把 token 流切分成区间，并返回每个区间的 key。
 
@@ -473,6 +474,8 @@ class UrlSegmentTokenDatabase(TokenDatabase):
         # 中途 break（lookup / retrieve 遇到 miss 就会），文章元数据依然完整。
         hashed_chunks: List[Tuple[int, int, int]] = []
         for span_start, span_end, url in prompt_spans:
+            if url is not None and not include_document_chunks:
+                continue
             # 每个段（文章或空隙）内部再按 chunk_size 切分成子块，
             # 每个子块单独内容 hash，支持增量刷新与流水线并行。
             for chunk_start in range(span_start, span_end, self.chunk_size):
@@ -606,3 +609,9 @@ class UrlSegmentTokenDatabase(TokenDatabase):
     def remove_request_document_spans(self, request_id: str) -> None:
         with self._lock:
             self._request_document_spans.pop(request_id, None)
+
+    def get_request_document_spans(
+        self, request_id: str
+    ) -> tuple[tuple[int, int, str], ...]:
+        with self._lock:
+            return self._request_document_spans.get(request_id, ())

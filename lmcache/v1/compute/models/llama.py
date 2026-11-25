@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# Standard
+from collections.abc import Callable
+
 # Third Party
 from torch import nn
 import torch
@@ -55,9 +58,12 @@ class LMCLlamaModel(nn.Module):
     def compute_layer(
         self,
         input_ids: torch.Tensor,
+        capture_kv: Callable[[torch.Tensor, torch.Tensor], None] | None = None,
     ):
         hidden_states = self.vllm_model.get_input_embeddings(input_ids.cuda())
         residual = None
+        if capture_kv is not None:
+            positions = torch.arange(input_ids.numel(), device=hidden_states.device)
 
         # TODO (Jiayi): reduce the number of calls
         attn_output = None
@@ -102,9 +108,14 @@ class LMCLlamaModel(nn.Module):
                 dim=-1,
             )
 
-            q, k, v, residual, attn_output, attn_metadata = self.blender.process_qkv(
-                q, k, v, residual, idx, attn_output, attn_metadata
-            )
+            if capture_kv is not None:
+                q, k = layer.self_attn.rotary_emb(positions, q, k)
+                capture_kv(k, v)
+                attn_output = torch.empty_like(q)
+            else:
+                q, k, v, residual, attn_output, attn_metadata = self.blender.process_qkv(
+                    q, k, v, residual, idx, attn_output, attn_metadata
+                )
 
             num_heads = self.vllm_attn_layers[idx].num_heads
             num_kv_heads = self.vllm_attn_layers[idx].num_kv_heads
@@ -115,9 +126,19 @@ class LMCLlamaModel(nn.Module):
             v = v.view(-1, num_kv_heads, head_size)
             attn_output = attn_output.view(-1, num_heads, head_size)
 
-            attn_output = self.lmc_attn_layers[idx].forward_contiguous(
-                q, k, v, attn_output, attn_metadata
-            )
+            attention = self.lmc_attn_layers[idx]
+            if (
+                capture_kv is None
+                and self.blender.document_reuse_mask is not None
+                and self.blender.metadata.imp_indices is not None
+            ):
+                attn_output = attention.forward_selected(
+                    q, k, v, attn_output, self.blender.metadata.imp_indices
+                )
+            else:
+                attn_output = attention.forward_contiguous(
+                    q, k, v, attn_output, attn_metadata
+                )
 
             attn_output = attn_output.view(-1, num_heads * head_size)
             k = k.view(-1, num_kv_heads * head_size)

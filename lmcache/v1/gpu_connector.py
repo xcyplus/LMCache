@@ -400,24 +400,30 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
 
-        num_all_tokens = ends[-1] - starts[0]
-        slot_mapping_full = slot_mapping[starts[0] : ends[-1]]
+        # The document blender also computes gaps before and after loaded spans.
+        blend_token_range = kwargs.get("blend_token_range")
+        buf_start, buf_end = (
+            blend_token_range
+            if blend_token_range is not None
+            else (starts[0], ends[-1])
+        )
+        num_all_tokens = buf_end - buf_start
+        slot_mapping_full = slot_mapping[buf_start:buf_end]
 
         # compute gap positions
         gap_mask = torch.ones(
             num_all_tokens, dtype=torch.bool, device=slot_mapping_full.device
         )
-        buf_offset = starts[0]
+        buf_offset = buf_start
 
         for start, end in zip(starts, ends, strict=False):
             gap_mask[start - buf_offset : end - buf_offset] = False
 
         self.current_gap_positions = torch.where(gap_mask)[0]
 
-        buf_offset = starts[0]
         if self.cache_positions:
             new_positions_full = torch.arange(
-                starts[0], ends[-1], dtype=torch.int64, device=self.kvcaches[0].device
+                buf_start, buf_end, dtype=torch.int64, device=self.kvcaches[0].device
             )
 
         buffer_shape = self.get_shape(num_all_tokens)

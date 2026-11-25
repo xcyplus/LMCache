@@ -35,6 +35,7 @@ from lmcache.v1.memory_management import (
     NixlCPUMemoryAllocator,
 )
 from lmcache.v1.storage_backend.storage_manager import StorageManager
+from lmcache.v1.storage_backend.document_kv import DocumentKVStore
 from lmcache.v1.token_database import (
     ChunkedTokenDatabase,
     SegmentTokenDatabase,
@@ -80,6 +81,7 @@ class LMCacheEngine:
         self.memory_allocator = memory_allocator
         self.token_database = token_database
         self.gpu_connector = gpu_connector
+        self.document_kv_store: Optional[DocumentKVStore] = None
 
         self.enable_p2p = config.enable_p2p
 
@@ -304,15 +306,24 @@ class LMCacheEngine:
         memory_objs = []
         tot_token_num = 0
         kv_dtype = self.metadata.kv_dtype
+        request_id = kwargs.get("request_id")
+        document_mode = self.document_kv_store is not None
+        chunk_options = {"include_document_chunks": False} if document_mode else {}
         for start, end, key in self.token_database.process_tokens(
-            tokens=tokens, mask=mask, request_id=kwargs.get("request_id")
+            tokens=tokens,
+            mask=mask,
+            request_id=request_id,
+            **chunk_options,
         ):
             assert isinstance(key, CacheEngineKey)
 
             keys_multi_layer = key.split_layers(self.num_layers)
 
             # Only check the first layer
-            if self.storage_manager.contains(keys_multi_layer[0]):
+            if self.storage_manager.contains(
+                keys_multi_layer[0],
+                search_range=["LocalCPUBackend"] if document_mode else None,
+            ):
                 continue
 
             # Allocate the memory object
@@ -362,7 +373,11 @@ class LMCacheEngine:
             for layer_id in range(self.num_layers):
                 yield
                 next(mem_obj_generator)
-                self.storage_manager.batched_put(keys[layer_id], memory_objs[layer_id])
+                self.storage_manager.batched_put(
+                    keys[layer_id],
+                    memory_objs[layer_id],
+                    location="LocalCPUBackend" if document_mode else None,
+                )
         else:
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`
