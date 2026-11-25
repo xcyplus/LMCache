@@ -47,6 +47,7 @@ from lmcache.integration.vllm.utils import ENGINE_NAME
 from lmcache.v1.cache_engine import LMCacheEngineBuilder
 from lmcache.v1.proactive_refresh import ProactiveRefreshManager
 from lmcache.v1.token_database import UrlSegmentTokenDatabase
+from trace_experiment_utils import build_prompt
 
 POLICIES = ["norefresh", "passive", "proactive", "proactive_full"]
 # 与 trace_builder.FAKE_ENTITY 保持一致（运行环境可能没有 datasets，
@@ -97,15 +98,6 @@ def chunk_in_storage(engine, chunk_hash):
     if engine.use_layerwise:
         return all(engine.storage_manager.contains(k) for k in key.split_layers(engine.num_layers))
     return engine.storage_manager.contains(key)
-
-
-def build_prompt(tokenizer, sys_prompt, urls, current_docs, question):
-    """[BOS+sys][去BOS 文档们][去BOS 问题]，与盲编码 token 形态严格对齐。"""
-    ids = tokenizer.encode(sys_prompt)
-    for u in urls:
-        ids = ids + tokenizer.encode(current_docs[u])[1:]
-    ids = ids + tokenizer.encode(question)[1:]
-    return ids
 
 
 def run_policy(policy, trace, llm, tokenizer, bg_budget, order="hot", drain_on_update=True):
